@@ -1,25 +1,44 @@
 ```dataviewjs
+// Dataview re-executes this whole script from scratch on every relevant metadata
+// change — including the frontmatter writes this script itself makes when you add
+// or edit a food. Without this, that self-triggered refresh would silently reset
+// the selected date and re-scan the whole vault for suggestions on every edit.
+// Stashing state on `window` lets it survive across those re-executions.
+window.__mealsWidgetState = window.__mealsWidgetState || {
+    selectedDate: moment().format("YYYY-MM-DD"),
+    foodSuggestions: null,
+    suggestionsBuiltAt: 0
+};
+const mealsState = window.__mealsWidgetState;
+
 // 1. Create a container for our UI
 const wrapper = dv.el("div", "");
 wrapper.style.display = "flex";
 wrapper.style.flexDirection = "column";
 wrapper.style.gap = "15px";
 
-// 2. Create the Date Picker
-const dateInput = document.createElement("input");
-dateInput.type = "date";
-dateInput.style.padding = "5px";
-dateInput.style.width = "fit-content";
-dateInput.style.background = "var(--background-modifier-form-field)";
-dateInput.style.color = "var(--text-normal)";
-dateInput.style.border = "1px solid var(--background-modifier-border)";
-dateInput.style.borderRadius = "4px";
+function styleInput(el) {
+    el.style.padding = "5px";
+    el.style.background = "var(--background-modifier-form-field)";
+    el.style.color = "var(--text-normal)";
+    el.style.border = "1px solid var(--background-modifier-border)";
+    el.style.borderRadius = "4px";
+}
 
-dateInput.value = moment().format("YYYY-MM-DD");
-wrapper.appendChild(dateInput);
+function makeTh(text) {
+    const th = document.createElement("th");
+    th.textContent = text;
+    return th;
+}
 
-const outputArea = document.createElement("div");
-wrapper.appendChild(outputArea);
+function makeTd(text) {
+    const td = document.createElement("td");
+    td.textContent = text;
+    return td;
+}
+
+// Core nutrition fields always shown/available for inline custom entry
+const CORE_NUTRITION_KEYS = ["calories", "protein", "carbs", "fat"];
 
 // Unit mappings for standard table headers
 const unitMapping = {
@@ -38,47 +57,26 @@ const unitMapping = {
     iron: "mg"
 };
 
-// Helper function to find a file in specific directories
-function findFoodFile(name) {
-    const validExtensions = ["md", "cook"];
-    const targetFolders = ["foods", "recipes"];
-
-    // Get all files in the vault
-    const files = app.vault.getFiles();
-
-    return files.find(file => {
-        // Match filename (without extension)
-        if (file.basename !== name) return false;
-
-        // Match allowed extensions
-        if (!validExtensions.includes(file.extension)) return false;
-
-        // Check if the file lives anywhere inside the target folders
-        return targetFolders.some(folder => file.path.startsWith(`${folder}/`));
-    }) || null;
-}
-
-// Helper function to parse *all* nutrition keys from raw text
+// Helper function to parse *all* nutrition keys from raw text (frontmatter of a food/recipe file)
 function parseNutritionFromText(content) {
     const nutrition = {};
-    
-    // Match the nutrition block until the next top-level YAML key or the end of frontmatter
+
     const nutritionMatch = content.match(/nutrition:\s*\n([\s\S]*?)(?=\n\w+:|\n---|$)/);
     if (!nutritionMatch) return null;
-    
+
     const lines = nutritionMatch[1].split('\n');
     for (let line of lines) {
         const parts = line.split(':');
         if (parts.length < 2) continue;
-        
+
         const key = parts[0].trim();
         const val = parseFloat(parts[1].trim());
-        
+
         if (key && !isNaN(val)) {
             nutrition[key] = val;
         }
     }
-    
+
     return Object.keys(nutrition).length > 0 ? nutrition : null;
 }
 
@@ -89,81 +87,471 @@ function formatHeader(key) {
     return unit ? `${capitalized} (${unit})` : capitalized;
 }
 
-// 3. Main Function to read the file and render the table
+// Fuzzy subsequence match: every character of `query` must appear in `text`, in
+// order (case-insensitive, ignoring spaces/hyphens/underscores on both sides), so
+// "so good" matches "so-good-brand-...". Returns a score (lower = better: tighter,
+// earlier matches) or null if `query` doesn't match at all.
+function fuzzyScore(query, text) {
+    const q = query.toLowerCase().replace(/[-_\s]/g, "");
+    const t = text.toLowerCase().replace(/[-_\s]/g, "");
+    if (!q) return 0;
+
+    let qi = 0, score = 0, lastMatch = -1;
+    for (let ti = 0; ti < t.length && qi < q.length; ti++) {
+        if (t[ti] === q[qi]) {
+            if (lastMatch !== -1) score += ti - lastMatch - 1;
+            lastMatch = ti;
+            qi++;
+        }
+    }
+    if (qi < q.length) return null;
+
+    score += t.indexOf(q[0]); // earlier overall start is a slightly better match
+    return score;
+}
+
+// Parse a "food" value. A "[[target|alias]]" / "[[target]]" wikilink refers to a
+// foods/recipes file; anything else is automatically treated as a one-off custom
+// food (no file lookup is attempted for it).
+function resolveFoodLink(foodStr) {
+    const m = foodStr.match(/^\[\[([^\]|]+)(?:\|([^\]]+))?\]\]$/);
+    if (m) {
+        return { target: m[1].trim(), display: (m[2] || m[1]).trim(), isLink: true };
+    }
+    return { target: foodStr, display: foodStr, isLink: false };
+}
+
+// Suggestions for the "add food" autocomplete, keyed by alias since filenames are sluggified
+function getFoodSuggestions() {
+    const validExtensions = ["md", "cook"];
+    const targetFolders = ["foods", "recipes"];
+    const files = app.vault.getFiles().filter(f =>
+        validExtensions.includes(f.extension) &&
+        targetFolders.some(folder => f.path.startsWith(`${folder}/`))
+    );
+
+    const suggestions = [];
+    for (const file of files) {
+        const fm = app.metadataCache.getFileCache(file)?.frontmatter;
+        let aliases = fm?.aliases;
+        if (typeof aliases === 'string') aliases = aliases.split(',').map(a => a.trim());
+        if (!aliases || aliases.length === 0) aliases = [file.basename];
+        for (const alias of aliases) {
+            if (alias) suggestions.push({ path: file.path.replace(/\.[^/.]+$/, ""), alias: alias.trim() });
+        }
+    }
+    return suggestions;
+}
+
+// Rebuilding this means scanning every file in foods/recipes; cache it across the
+// script's re-executions (see mealsState above) and only rebuild occasionally so
+// our own frontmatter writes don't force a full vault re-scan on every add/edit.
+const SUGGESTIONS_TTL_MS = 5 * 60 * 1000;
+if (!mealsState.foodSuggestions || Date.now() - mealsState.suggestionsBuiltAt > SUGGESTIONS_TTL_MS) {
+    mealsState.foodSuggestions = getFoodSuggestions();
+    mealsState.suggestionsBuiltAt = Date.now();
+}
+const foodSuggestions = mealsState.foodSuggestions;
+
+const foodDatalist = document.createElement("datalist");
+foodDatalist.id = "meals-food-datalist";
+for (const s of foodSuggestions) {
+    const opt = document.createElement("option");
+    opt.value = s.alias;
+    foodDatalist.appendChild(opt);
+}
+wrapper.appendChild(foodDatalist);
+
+// Watches a text input for a "[[" trigger and shows a filtered dropdown of the
+// given suggestions (matched by alias) below it, like Obsidian's native link
+// autocomplete. Selecting an entry inserts "[[path]]" or "[[path|alias]]" in its
+// place. The dropdown is fixed-positioned off the real DOM (not the input's
+// parent), so it can't get clipped by an ancestor's overflow (e.g. the table's
+// scroll wrapper).
+function attachLinkSuggest(inputEl, suggestionsList) {
+    const dropdown = document.createElement("div");
+    dropdown.style.position = "fixed";
+    dropdown.style.zIndex = "200";
+    dropdown.style.background = "var(--background-primary)";
+    dropdown.style.border = "1px solid var(--background-modifier-border)";
+    dropdown.style.borderRadius = "4px";
+    dropdown.style.maxHeight = "200px";
+    dropdown.style.overflowY = "auto";
+    dropdown.style.display = "none";
+    dropdown.style.minWidth = "200px";
+    dropdown.style.boxShadow = "0 2px 8px rgba(0, 0, 0, 0.3)";
+    document.body.appendChild(dropdown);
+
+    let activeIndex = -1;
+    let currentMatches = [];
+    let linkStart = -1;
+
+    function positionDropdown() {
+        const rect = inputEl.getBoundingClientRect();
+        dropdown.style.left = `${rect.left}px`;
+        dropdown.style.top = `${rect.bottom + 2}px`;
+        dropdown.style.minWidth = `${rect.width}px`;
+    }
+
+    function closeDropdown() {
+        dropdown.style.display = "none";
+        dropdown.innerHTML = "";
+        activeIndex = -1;
+        currentMatches = [];
+        linkStart = -1;
+    }
+
+    function selectMatch(match) {
+        const before = inputEl.value.slice(0, linkStart);
+        const linkText = match.path === match.alias ? `[[${match.path}]]` : `[[${match.path}|${match.alias}]]`;
+        inputEl.value = before + linkText;
+        closeDropdown();
+        inputEl.focus();
+    }
+
+    function renderDropdown() {
+        dropdown.innerHTML = "";
+        if (currentMatches.length === 0) {
+            closeDropdown();
+            return;
+        }
+        currentMatches.forEach((m, i) => {
+            const item = document.createElement("div");
+            item.textContent = m.alias;
+            item.style.padding = "4px 8px";
+            item.style.cursor = "pointer";
+            item.style.backgroundColor = i === activeIndex ? "var(--background-modifier-hover)" : "";
+            item.addEventListener("mousedown", (e) => {
+                e.preventDefault();
+                selectMatch(m);
+            });
+            dropdown.appendChild(item);
+        });
+        positionDropdown();
+        dropdown.style.display = "block";
+    }
+
+    inputEl.addEventListener("input", () => {
+        const val = inputEl.value;
+        const idx = val.lastIndexOf("[[");
+        if (idx === -1) {
+            closeDropdown();
+            return;
+        }
+        const afterOpen = val.slice(idx + 2);
+        if (afterOpen.includes("]]")) {
+            closeDropdown();
+            return;
+        }
+        linkStart = idx;
+        const query = afterOpen;
+        currentMatches = suggestionsList
+            .map(s => ({ s, score: fuzzyScore(query, s.alias) }))
+            .filter(m => m.score !== null)
+            .sort((a, b) => a.score - b.score)
+            .slice(0, 20)
+            .map(m => m.s);
+        activeIndex = currentMatches.length > 0 ? 0 : -1;
+        renderDropdown();
+    });
+
+    // Registered before any caller-added keydown listener, and stops immediate
+    // propagation on a handled key so a selection/navigation keystroke can't also
+    // reach a later listener (e.g. an "Enter to save/submit" handler) on the same input.
+    inputEl.addEventListener("keydown", (e) => {
+        if (dropdown.style.display === "none") return;
+        if (e.key === "ArrowDown") {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            activeIndex = Math.min(activeIndex + 1, currentMatches.length - 1);
+            renderDropdown();
+        } else if (e.key === "ArrowUp") {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            activeIndex = Math.max(activeIndex - 1, 0);
+            renderDropdown();
+        } else if (e.key === "Enter") {
+            if (activeIndex >= 0) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                selectMatch(currentMatches[activeIndex]);
+            }
+        } else if (e.key === "Escape") {
+            e.stopImmediatePropagation();
+            closeDropdown();
+        }
+    });
+
+    inputEl.addEventListener("blur", () => {
+        setTimeout(closeDropdown, 150);
+    });
+    window.addEventListener("scroll", closeDropdown, true);
+    window.addEventListener("resize", closeDropdown);
+
+    return { isOpen: () => dropdown.style.display !== "none" };
+}
+
+// 2. Calendar date picker
+const folderPath = "daily";
+let selectedDate = mealsState.selectedDate;
+let calendarViewMonth = moment(selectedDate, "YYYY-MM-DD");
+
+const dateWrapperPos = document.createElement("div");
+dateWrapperPos.style.position = "relative";
+dateWrapperPos.style.width = "fit-content";
+
+const dateButton = document.createElement("button");
+styleInput(dateButton);
+dateButton.style.cursor = "pointer";
+dateButton.style.textAlign = "left";
+dateButton.style.width = "fit-content";
+
+function updateDateButtonLabel() {
+    dateButton.textContent = moment(selectedDate, "YYYY-MM-DD").format("ddd, MMM D, YYYY");
+}
+updateDateButtonLabel();
+
+const calendarPopup = document.createElement("div");
+calendarPopup.style.display = "none";
+calendarPopup.style.position = "absolute";
+calendarPopup.style.top = "calc(100% + 4px)";
+calendarPopup.style.left = "0";
+calendarPopup.style.zIndex = "100";
+calendarPopup.style.background = "var(--background-primary)";
+calendarPopup.style.border = "1px solid var(--background-modifier-border)";
+calendarPopup.style.borderRadius = "6px";
+calendarPopup.style.padding = "10px";
+calendarPopup.style.boxShadow = "0 2px 8px rgba(0, 0, 0, 0.3)";
+
+// Which dates (YYYY-MM-DD) in the given month already have meal entries
+function getDatesWithEntriesForMonth(monthMoment) {
+    const prefix = monthMoment.format("YYYY-MM");
+    const files = app.vault.getFiles().filter(f =>
+        f.extension === "md" &&
+        f.path.startsWith(`${folderPath}/`) &&
+        f.basename.startsWith(prefix)
+    );
+
+    const set = new Set();
+    for (const file of files) {
+        const fm = app.metadataCache.getFileCache(file)?.frontmatter;
+        if (Array.isArray(fm?.meals) && fm.meals.length > 0) {
+            set.add(file.basename);
+        }
+    }
+    return set;
+}
+
+function renderCalendar() {
+    calendarPopup.innerHTML = "";
+
+    const header = document.createElement("div");
+    header.style.display = "flex";
+    header.style.justifyContent = "space-between";
+    header.style.alignItems = "center";
+    header.style.marginBottom = "8px";
+    header.style.gap = "8px";
+
+    const prevBtn = document.createElement("button");
+    prevBtn.textContent = "‹";
+    prevBtn.addEventListener("click", () => {
+        calendarViewMonth = calendarViewMonth.clone().subtract(1, "month");
+        renderCalendar();
+    });
+
+    const nextBtn = document.createElement("button");
+    nextBtn.textContent = "›";
+    nextBtn.addEventListener("click", () => {
+        calendarViewMonth = calendarViewMonth.clone().add(1, "month");
+        renderCalendar();
+    });
+
+    const label = document.createElement("span");
+    label.style.fontWeight = "bold";
+    label.textContent = calendarViewMonth.format("MMMM YYYY");
+
+    header.appendChild(prevBtn);
+    header.appendChild(label);
+    header.appendChild(nextBtn);
+    calendarPopup.appendChild(header);
+
+    const grid = document.createElement("div");
+    grid.style.display = "grid";
+    grid.style.gridTemplateColumns = "repeat(7, 32px)";
+    grid.style.gap = "2px";
+
+    for (const d of ["S", "M", "T", "W", "T", "F", "S"]) {
+        const cell = document.createElement("div");
+        cell.textContent = d;
+        cell.style.textAlign = "center";
+        cell.style.fontSize = "0.75em";
+        cell.style.color = "var(--text-muted)";
+        grid.appendChild(cell);
+    }
+
+    const startOfMonth = calendarViewMonth.clone().startOf("month");
+    const startDay = startOfMonth.day();
+    const daysInMonth = calendarViewMonth.daysInMonth();
+    const datesWithEntries = getDatesWithEntriesForMonth(calendarViewMonth);
+    const todayStr = moment().format("YYYY-MM-DD");
+
+    for (let i = 0; i < startDay; i++) {
+        grid.appendChild(document.createElement("div"));
+    }
+
+    for (let day = 1; day <= daysInMonth; day++) {
+        const cellDateStr = startOfMonth.clone().date(day).format("YYYY-MM-DD");
+        const hasEntries = datesWithEntries.has(cellDateStr);
+        const isSelected = cellDateStr === selectedDate;
+
+        const btn = document.createElement("button");
+        btn.textContent = String(day);
+        btn.style.width = "32px";
+        btn.style.height = "32px";
+        btn.style.border = cellDateStr === todayStr ? "1px solid var(--interactive-accent)" : "1px solid transparent";
+        btn.style.borderRadius = "4px";
+        btn.style.cursor = "pointer";
+        btn.style.background = hasEntries ? "var(--interactive-accent)" : "transparent";
+        btn.style.color = hasEntries ? "var(--text-on-accent)" : "var(--text-normal)";
+        btn.style.fontWeight = isSelected ? "bold" : "normal";
+        btn.style.outline = isSelected ? "2px solid var(--text-normal)" : "none";
+
+        btn.addEventListener("click", () => {
+            selectedDate = cellDateStr;
+            mealsState.selectedDate = cellDateStr;
+            updateDateButtonLabel();
+            calendarPopup.style.display = "none";
+            renderMealsTable(selectedDate);
+        });
+
+        grid.appendChild(btn);
+    }
+
+    calendarPopup.appendChild(grid);
+}
+
+dateButton.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const isOpen = calendarPopup.style.display === "block";
+    if (isOpen) {
+        calendarPopup.style.display = "none";
+        return;
+    }
+    calendarViewMonth = moment(selectedDate, "YYYY-MM-DD");
+    renderCalendar();
+    calendarPopup.style.display = "block";
+});
+
+document.addEventListener("click", (e) => {
+    if (!dateWrapperPos.contains(e.target)) {
+        calendarPopup.style.display = "none";
+    }
+});
+
+dateWrapperPos.appendChild(dateButton);
+dateWrapperPos.appendChild(calendarPopup);
+wrapper.appendChild(dateWrapperPos);
+
+const outputArea = document.createElement("div");
+wrapper.appendChild(outputArea);
+
+// 3. Main function: render the meals table (and its inline "add food" row) for a given date.
+// The table is always shown, even with zero entries, so a food can always be added.
 async function renderMealsTable(dateStr) {
-    outputArea.innerHTML = ""; 
-    
-    const folderPath = "daily";
+    outputArea.innerHTML = "";
+
     const filePath = `${folderPath}/${dateStr}.md`;
     const file = app.vault.getAbstractFileByPath(filePath);
-    
+
     if (!file) {
         outputArea.innerHTML = `<em>No daily note found for <strong>${dateStr}</strong> at <code>${filePath}</code>.</em>`;
         return;
     }
-    
-    const content = await app.vault.read(file);
-    const match = content.match(/```meals\n([\s\S]*?)```/);
-    
-    if (!match) {
-        outputArea.innerHTML = `<em>No <code>meals</code> block found in the note for ${dateStr}.</em>`;
-        return;
+
+    const fm = app.metadataCache.getFileCache(file)?.frontmatter;
+    // A local, mutable copy of the entries. Edits below mutate this directly and
+    // re-render from it immediately, instead of re-reading from Obsidian's
+    // metadata cache — that cache can still be stale for a moment right after our
+    // own `processFrontMatter` write resolves, which was the real source of the
+    // remaining delay even after force-refreshing Dataview.
+    let entries = Array.isArray(fm?.meals) ? fm.meals.map(e => ({ ...e })) : [];
+
+    // Persists the current in-memory `entries` to disk and asks Dataview to
+    // refresh other views. The on-screen table is already up to date by the time
+    // this runs (see rebuildTable below), so this doesn't gate the visible response.
+    async function persistMeals() {
+        await app.fileManager.processFrontMatter(file, (fm) => {
+            fm.meals = entries;
+        });
+        app.workspace.trigger("dataview:refresh-views");
     }
-    
-    const lines = match[1].trim().split('\n');
-    
-    let allKeys = new Set();
+
+    async function rebuildTable() {
+    outputArea.innerHTML = "";
+    let allKeys = new Set(CORE_NUTRITION_KEYS);
     let foodsData = [];
     let totals = {};
-    let missing = [];
-    
-    for (let line of lines) {
-        if (!line.trim()) continue;
-        
-        let parts = line.trim().split(' ');
-        let servings = parseFloat(parts.pop());
-        let foodName = parts.join(' ').replace(/[\[\]]/g, ''); 
-        
-        // Try Dataview's index first
-        let page = dv.page(`"${foodName}"`);
+
+    for (let entry of entries) {
+        const { target, display, isLink } = resolveFoodLink(entry.food);
+        const servings = parseFloat(entry.amount);
         let nutrition = null;
-        
-        if (page && page.nutrition) {
+
+        if (entry.nutrition) {
             nutrition = {};
-            // Dataview parses objects, extract all numeric fields
-            for (let k of Object.keys(page.nutrition)) {
-                let val = parseFloat(page.nutrition[k]);
+            for (let [k, v] of Object.entries(entry.nutrition)) {
+                let val = parseFloat(v);
                 if (!isNaN(val)) nutrition[k] = val;
             }
-        } else {
-            // Fallback: Manually search
-            let foodFile = findFoodFile(foodName);
-            if (foodFile) {
-                let foodContent = await app.vault.read(foodFile);
-                nutrition = parseNutritionFromText(foodContent);
+        } else if (isLink) {
+            // Resolve the link the same way Obsidian itself would (handles a bare
+            // basename like "name" as well as a full path like "foods/name").
+            const targetFile = app.metadataCache.getFirstLinkpathDest(target, file.path);
+            if (targetFile) {
+                const targetFm = app.metadataCache.getFileCache(targetFile)?.frontmatter;
+                if (targetFm?.nutrition) {
+                    nutrition = {};
+                    for (let k of Object.keys(targetFm.nutrition)) {
+                        let val = parseFloat(targetFm.nutrition[k]);
+                        if (!isNaN(val)) nutrition[k] = val;
+                    }
+                } else {
+                    let foodContent = await app.vault.read(targetFile);
+                    nutrition = parseNutritionFromText(foodContent);
+                }
             }
         }
-        
+        // else: plain, non-wikilink food with no inline nutrition — treated as a
+        // custom food with unknown nutrition. No lookup, no error, just an
+        // incomplete row (shown with "-" below).
+
+        const foodRow = {
+            name: display,
+            rawFood: entry.food,
+            servings: servings,
+            nutrients: {},
+            incomplete: !nutrition,
+            isLink: isLink,
+            // Raw (pre-serving-multiplication) nutrition, editable only for custom
+            // (non-wikilink) foods since that's what's actually stored inline.
+            rawNutrition: (!isLink && nutrition) ? { ...nutrition } : {}
+        };
+
         if (nutrition) {
-            let foodRow = { name: foodName, servings: servings, nutrients: {} };
-            
             for (let [k, v] of Object.entries(nutrition)) {
-                // Normalize key to check against serving size variations
                 let normKey = k.toLowerCase().replace(/[-_]/g, ' ');
                 if (normKey === 'serving size') continue;
-                
+
                 allKeys.add(k);
                 let calculatedValue = v * servings;
                 foodRow.nutrients[k] = calculatedValue;
                 totals[k] = (totals[k] || 0) + calculatedValue;
             }
-            
-            foodsData.push(foodRow);
-        } else {
-            missing.push(foodName);
         }
+
+        foodsData.push(foodRow);
     }
-    
+
     // Convert keys to array and sort (prioritizing major macros first)
     const priority = ['calories', 'fat', 'carbohydrates', 'carbs', 'protein'];
     let keyArray = Array.from(allKeys).sort((a, b) => {
@@ -175,59 +563,327 @@ async function renderMealsTable(dateStr) {
         return a.localeCompare(b);
     });
 
-    // 4. Build HTML table
-    let thead = `
-        <tr class="table-view-tr-header">
-            <th>Food</th>
-            <th>Servings</th>
-            ${keyArray.map(k => `<th>${formatHeader(k)}</th>`).join('')}
-        </tr>
-    `;
+    // 4. Build the table
+    const tableContainer = document.createElement("div");
+    tableContainer.style.overflowX = "auto";
 
-    // Totals Row (Cumulative on top)
-    let totalsRow = `
-        <tr style="font-weight: bold; background-color: var(--background-secondary);">
-            <td>TOTALS</td>
-            <td>-</td>
-            ${keyArray.map(k => `<td>${(totals[k] || 0).toFixed(1)}</td>`).join('')}
-        </tr>
-    `;
-    
-    // Per-food Rows
-    let bodyRows = foodsData.map(food => {
-        let nutrientCols = keyArray.map(k => `<td>${(food.nutrients[k] || 0).toFixed(1)}</td>`).join('');
-        return `<tr>
-            <td>${food.name}</td>
-            <td>${food.servings}</td>
-            ${nutrientCols}
-        </tr>`;
-    }).join('\n');
+    const table = document.createElement("table");
+    table.className = "dataview table-view-table";
+    table.style.width = "100%";
+    table.style.whiteSpace = "nowrap";
 
-    let tableHTML = `
-        <div style="overflow-x: auto;">
-            <table class="dataview table-view-table" style="width: 100%; white-space: nowrap;">
-                <thead>${thead}</thead>
-                <tbody>
-                    ${totalsRow}
-                    ${bodyRows}
-                </tbody>
-            </table>
-        </div>
-    `;
-    
-    if (missing.length > 0) {
-        tableHTML += `<br><p style="color: var(--text-error);">⚠️ <strong>Could not find data for:</strong> ${missing.join(", ")}</p>`;
+    const thead = document.createElement("thead");
+    const headerRow = document.createElement("tr");
+    headerRow.className = "table-view-tr-header";
+    headerRow.appendChild(makeTh("Food"));
+    headerRow.appendChild(makeTh("Servings"));
+    for (const k of keyArray) headerRow.appendChild(makeTh(formatHeader(k)));
+    headerRow.appendChild(makeTh(""));
+    thead.appendChild(headerRow);
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+
+    const totalsRow = document.createElement("tr");
+    totalsRow.style.fontWeight = "bold";
+    totalsRow.style.backgroundColor = "var(--background-secondary)";
+    totalsRow.appendChild(makeTd("TOTALS"));
+    totalsRow.appendChild(makeTd("-"));
+    for (const k of keyArray) totalsRow.appendChild(makeTd((totals[k] || 0).toFixed(1)));
+    totalsRow.appendChild(makeTd(""));
+    tbody.appendChild(totalsRow);
+
+    // Trailing cell with a "−" button that removes this entry from `meals`.
+    function buildRemoveCell(entryIndex) {
+        const td = document.createElement("td");
+        const btn = document.createElement("button");
+        btn.textContent = "−";
+        btn.title = "Remove entry";
+        btn.style.color = "var(--text-error)";
+        btn.style.lineHeight = "1";
+
+        btn.addEventListener("click", async (e) => {
+            e.stopPropagation();
+            entries.splice(entryIndex, 1);
+            await rebuildTable();
+            persistMeals();
+        });
+
+        td.appendChild(btn);
+        return td;
     }
-    
-    outputArea.innerHTML = tableHTML;
+
+    // Food-name cell, editable independently of the nutrition-edit row: click it to
+    // rename/re-link the entry, with "[[" triggering foods/recipes note search.
+    function buildFoodCell(food, entryIndex) {
+        const td = document.createElement("td");
+        td.textContent = food.name;
+        td.style.cursor = "pointer";
+        td.title = "Click to edit food";
+
+        td.addEventListener("click", (e) => {
+            e.stopPropagation();
+
+            const editTd = document.createElement("td");
+            const inp = document.createElement("input");
+            inp.type = "text";
+            inp.value = food.rawFood;
+            inp.style.width = "100%";
+            inp.style.minWidth = "150px";
+            styleInput(inp);
+            inp.setAttribute("list", "meals-food-datalist");
+            editTd.appendChild(inp);
+            td.replaceWith(editTd);
+            inp.focus();
+            inp.select();
+
+            const linkSuggest = attachLinkSuggest(inp, foodSuggestions);
+
+            async function saveFoodEdit() {
+                const newValue = inp.value.trim();
+                if (!newValue || newValue === food.rawFood) {
+                    await rebuildTable();
+                    return;
+                }
+                entries[entryIndex].food = newValue;
+                await rebuildTable();
+                persistMeals();
+            }
+
+            inp.addEventListener("keydown", (e2) => {
+                if (linkSuggest.isOpen()) return;
+                if (e2.key === "Enter") saveFoodEdit();
+                if (e2.key === "Escape") rebuildTable();
+            });
+            inp.addEventListener("blur", () => {
+                setTimeout(() => {
+                    if (!linkSuggest.isOpen()) saveFoodEdit();
+                }, 200);
+            });
+        });
+
+        return td;
+    }
+
+    function buildDisplayRow(food, entryIndex) {
+        const tr = document.createElement("tr");
+        tr.appendChild(buildFoodCell(food, entryIndex));
+        tr.appendChild(makeTd(String(food.servings)));
+        for (const k of keyArray) {
+            let text;
+            if (food.nutrients.hasOwnProperty(k)) text = food.nutrients[k].toFixed(1);
+            else if (food.incomplete) text = "-";
+            else text = "0.0";
+            tr.appendChild(makeTd(text));
+        }
+        tr.appendChild(buildRemoveCell(entryIndex));
+
+        if (!food.isLink) {
+            tr.style.cursor = "pointer";
+            tr.title = "Click to edit nutrition";
+            tr.addEventListener("mouseenter", () => { tr.style.backgroundColor = "var(--background-modifier-hover)"; });
+            tr.addEventListener("mouseleave", () => { tr.style.backgroundColor = ""; });
+            tr.addEventListener("click", () => {
+                const editTr = buildEditRow(food, entryIndex);
+                tr.replaceWith(editTr);
+                const firstInput = editTr.querySelector("input");
+                if (firstInput) firstInput.focus();
+            });
+        }
+
+        return tr;
+    }
+
+    // Editable row for a custom (non-wikilink) food — lets you fill in/correct its
+    // inline nutrition values directly from the table.
+    function buildEditRow(food, entryIndex) {
+        const tr = document.createElement("tr");
+        tr.appendChild(buildFoodCell(food, entryIndex));
+        tr.appendChild(makeTd(String(food.servings)));
+
+        const editInputs = {};
+        for (const k of keyArray) {
+            const cell = document.createElement("td");
+            if (CORE_NUTRITION_KEYS.includes(k)) {
+                const inp = document.createElement("input");
+                inp.type = "number";
+                inp.step = "0.1";
+                inp.style.width = "70px";
+                styleInput(inp);
+                const rawVal = food.rawNutrition[k];
+                inp.value = rawVal !== undefined ? rawVal : "";
+                editInputs[k] = inp;
+                cell.appendChild(inp);
+            } else {
+                const rawVal = food.rawNutrition[k];
+                cell.textContent = rawVal !== undefined ? rawVal : "-";
+            }
+            tr.appendChild(cell);
+        }
+        tr.appendChild(buildRemoveCell(entryIndex));
+
+        async function saveEdit() {
+            const nutrition = {};
+            for (const [k, inp] of Object.entries(editInputs)) {
+                const val = parseFloat(inp.value);
+                if (!isNaN(val)) nutrition[k] = val;
+            }
+            if (Object.keys(nutrition).length > 0) {
+                entries[entryIndex].nutrition = nutrition;
+            } else {
+                delete entries[entryIndex].nutrition;
+            }
+            await rebuildTable();
+            persistMeals();
+        }
+
+        for (const inp of Object.values(editInputs)) {
+            inp.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") saveEdit();
+                if (e.key === "Escape") rebuildTable();
+            });
+        }
+        tr.addEventListener("focusout", () => {
+            setTimeout(() => {
+                if (!tr.contains(document.activeElement)) saveEdit();
+            }, 0);
+        });
+
+        return tr;
+    }
+
+    foodsData.forEach((food, idx) => {
+        tbody.appendChild(buildDisplayRow(food, idx));
+    });
+
+    // 5. "Add food" row — append an entry to the note's `meals` frontmatter property on the fly.
+    // Food is a text input with alias autocomplete; if the typed text isn't a known
+    // alias it's saved as a plain (non-wikilink) custom food. Nutrition fields under
+    // the core macro columns are optional, for one-off foods with their own values.
+    const addRow = document.createElement("tr");
+
+    const foodCell = document.createElement("td");
+    const foodInput = document.createElement("input");
+    foodInput.type = "text";
+    foodInput.placeholder = "Add a food...";
+    foodInput.className = "meals-add-food-input";
+    foodInput.setAttribute("list", "meals-food-datalist");
+    foodInput.style.width = "100%";
+    foodInput.style.minWidth = "150px";
+    styleInput(foodInput);
+    foodCell.appendChild(foodInput);
+    addRow.appendChild(foodCell);
+    const addFoodLinkSuggest = attachLinkSuggest(foodInput, foodSuggestions);
+
+    const amountCell = document.createElement("td");
+    const amountInput = document.createElement("input");
+    amountInput.type = "number";
+    amountInput.step = "0.1";
+    amountInput.value = "1";
+    amountInput.style.width = "70px";
+    styleInput(amountInput);
+    amountCell.appendChild(amountInput);
+    addRow.appendChild(amountCell);
+
+    const nutritionInputs = {};
+    for (const k of keyArray) {
+        const cell = document.createElement("td");
+        if (CORE_NUTRITION_KEYS.includes(k)) {
+            const inp = document.createElement("input");
+            inp.type = "number";
+            inp.step = "0.1";
+            inp.placeholder = "-";
+            inp.style.width = "70px";
+            styleInput(inp);
+            nutritionInputs[k] = inp;
+            cell.appendChild(inp);
+        }
+        addRow.appendChild(cell);
+    }
+    addRow.appendChild(makeTd(""));
+    tbody.appendChild(addRow);
+
+    table.appendChild(tbody);
+    tableContainer.appendChild(table);
+    outputArea.appendChild(tableContainer);
+
+    const addControls = document.createElement("div");
+    addControls.style.display = "flex";
+    addControls.style.alignItems = "center";
+    addControls.style.gap = "10px";
+    addControls.style.marginTop = "8px";
+
+    const addButton = document.createElement("button");
+    addButton.textContent = "Add food";
+
+    const addStatus = document.createElement("span");
+    addStatus.style.fontSize = "0.85em";
+    addStatus.style.color = "var(--text-muted)";
+
+    addControls.appendChild(addButton);
+    addControls.appendChild(addStatus);
+    outputArea.appendChild(addControls);
+
+    async function handleAddFood() {
+        const typedText = foodInput.value.trim();
+        if (!typedText) {
+            addStatus.textContent = "Enter a food name.";
+            return;
+        }
+
+        const amount = parseFloat(amountInput.value);
+        if (isNaN(amount)) {
+            addStatus.textContent = "Enter a valid serving amount.";
+            return;
+        }
+
+        // A "[[...]]" already typed/selected via the link search is used as-is;
+        // otherwise resolve against known aliases, falling back to a plain custom food.
+        let foodValue;
+        if (/^\[\[.+\]\]$/.test(typedText)) {
+            foodValue = typedText;
+        } else {
+            const suggestionMatch = foodSuggestions.find(s => s.alias.toLowerCase() === typedText.toLowerCase());
+            if (suggestionMatch) {
+                foodValue = suggestionMatch.path === suggestionMatch.alias
+                    ? `[[${suggestionMatch.path}]]`
+                    : `[[${suggestionMatch.path}|${suggestionMatch.alias}]]`;
+            } else {
+                foodValue = typedText;
+            }
+        }
+
+        const newEntry = { food: foodValue, amount: amount };
+
+        const nutrition = {};
+        for (const [key, inp] of Object.entries(nutritionInputs)) {
+            const val = parseFloat(inp.value);
+            if (!isNaN(val)) nutrition[key] = val;
+        }
+        if (Object.keys(nutrition).length > 0) newEntry.nutrition = nutrition;
+
+        entries.push(newEntry);
+        await rebuildTable();
+        persistMeals();
+
+        // rebuildTable() rebuilt the whole row, including a fresh input, so the
+        // old `foodInput` reference is detached — look up the new one to refocus
+        // it, letting <food><enter> be repeated to add several foods in a row.
+        const newFoodInput = outputArea.querySelector(".meals-add-food-input");
+        if (newFoodInput) newFoodInput.focus();
+    }
+
+    addButton.addEventListener("click", handleAddFood);
+    const enterToAdd = (e) => { if (e.key === "Enter") handleAddFood(); };
+    foodInput.addEventListener("keydown", (e) => { if (!addFoodLinkSuggest.isOpen()) enterToAdd(e); });
+    amountInput.addEventListener("keydown", enterToAdd);
+    for (const inp of Object.values(nutritionInputs)) inp.addEventListener("keydown", enterToAdd);
+    }
+
+    await rebuildTable();
 }
 
-// 5. Event Listeners
-dateInput.addEventListener("change", (e) => {
-    renderMealsTable(e.target.value);
-});
-
-// Initial Render
-renderMealsTable(dateInput.value);
+// Initial render
+renderMealsTable(selectedDate);
 ```
 
