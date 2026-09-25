@@ -44,6 +44,79 @@ function makeTd(text) {
     return td;
 }
 
+function isServingSizeKey(key) {
+    return key.toLowerCase().replace(/[-_]/g, " ").replace(/\s+/g, " ").trim() === "serving size";
+}
+
+// Keep the numeric value used for calculations separate from any unit explicitly
+// written in the source (for example, "230 mg"). A bare YAML number has no
+// declared unit, so there is nothing to compare with the table header.
+function parseNutrientValue(rawValue) {
+    const value = parseFloat(rawValue);
+    let unit = null;
+    if (typeof rawValue === "string") {
+        const match = rawValue.trim().match(/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?\s*(.+?)\s*$/i);
+        if (match) unit = normalizeUnit(match[1]);
+    }
+    return { value, unit };
+}
+
+// Factors are relative to a convenient base unit for each quantity: grams,
+// millilitres, and kilocalories. Only units in the same quantity can convert.
+const UNIT_DEFINITIONS = {
+    "ng":       { quantity: "mass", factor: 0.000000001 },
+    "µg":       { quantity: "mass", factor: 0.000001 },
+    "mg":       { quantity: "mass", factor: 0.001 },
+    "g":        { quantity: "mass", factor: 1 },
+    "kg":       { quantity: "mass", factor: 1000 },
+    "oz":       { quantity: "mass", factor: 28.349523125 },
+    "lb":       { quantity: "mass", factor: 453.59237 },
+    "ml":       { quantity: "volume", factor: 1 },
+    "cl":       { quantity: "volume", factor: 10 },
+    "dl":       { quantity: "volume", factor: 100 },
+    "l":        { quantity: "volume", factor: 1000 },
+    "tsp":      { quantity: "volume", factor: 4.92892159375 },
+    "tbsp":     { quantity: "volume", factor: 14.78676478125 },
+    "fl oz":    { quantity: "volume", factor: 29.5735295625 },
+    "cup":      { quantity: "volume", factor: 236.5882365 },
+    "pt":       { quantity: "volume", factor: 473.176473 },
+    "qt":       { quantity: "volume", factor: 946.352946 },
+    "gal":      { quantity: "volume", factor: 3785.411784 },
+    "cal":      { quantity: "energy", factor: 0.001 },
+    "kcal":     { quantity: "energy", factor: 1 },
+    "j":        { quantity: "energy", factor: 0.000239005736 },
+    "kj":       { quantity: "energy", factor: 0.239005736 }
+};
+
+const UNIT_ALIASES = {
+    "ug": "µg", "μg": "µg", "mcg": "µg", "microgram": "µg", "micrograms": "µg",
+    "milligram": "mg", "milligrams": "mg", "gram": "g", "grams": "g",
+    "kilogram": "kg", "kilograms": "kg", "ounce": "oz", "ounces": "oz",
+    "pound": "lb", "pounds": "lb", "lbs": "lb",
+    "milliliter": "ml", "milliliters": "ml", "millilitre": "ml", "millilitres": "ml",
+    "liter": "l", "liters": "l", "litre": "l", "litres": "l",
+    "teaspoon": "tsp", "teaspoons": "tsp", "tablespoon": "tbsp", "tablespoons": "tbsp",
+    "fluid ounce": "fl oz", "fluid ounces": "fl oz", "floz": "fl oz",
+    "cups": "cup", "pint": "pt", "pints": "pt", "quart": "qt", "quarts": "qt",
+    "gallon": "gal", "gallons": "gal", "kilocalorie": "kcal", "kilocalories": "kcal",
+    "kilojoule": "kj", "kilojoules": "kj", "joule": "j", "joules": "j"
+};
+
+function normalizeUnit(unit) {
+    const rawUnit = String(unit).trim();
+    // On nutrition labels, capital-C "Cal" means a kilocalorie.
+    if (rawUnit === "Cal") return "kcal";
+    const normalized = rawUnit.toLowerCase().replace(/μ/g, "µ").replace(/\./g, "").replace(/\s+/g, " ");
+    return UNIT_ALIASES[normalized] || normalized;
+}
+
+function convertUnit(value, sourceUnit, targetUnit) {
+    const source = UNIT_DEFINITIONS[normalizeUnit(sourceUnit)];
+    const target = UNIT_DEFINITIONS[normalizeUnit(targetUnit)];
+    if (!source || !target || source.quantity !== target.quantity) return null;
+    return value * source.factor / target.factor;
+}
+
 // Core nutrition fields always shown/available for inline custom entry
 const CORE_NUTRITION_KEYS = ["calories", "protein", "carbs", "fat"];
 
@@ -77,10 +150,13 @@ function parseNutritionFromText(content) {
         if (parts.length < 2) continue;
 
         const key = parts[0].trim();
-        const val = parseFloat(parts[1].trim());
+        const rawVal = parts.slice(1).join(':').trim();
+        const val = isServingSizeKey(key) ? rawVal : parseFloat(rawVal);
 
-        if (key && !isNaN(val)) {
-            nutrition[key] = val;
+        if (key && (isServingSizeKey(key) ? rawVal.length > 0 : !isNaN(val))) {
+            // Return the original text so its declared unit remains available to
+            // the renderer; numeric parsing happens after the source is loaded.
+            nutrition[key] = rawVal;
         }
     }
 
@@ -505,12 +581,18 @@ async function renderMealsTable(dateStr) {
         const { target, display, isLink } = resolveFoodLink(entry.food);
         const servings = parseFloat(entry.amount);
         let nutrition = null;
+        let nutritionUnits = {};
 
         if (entry.nutrition) {
             nutrition = {};
             for (let [k, v] of Object.entries(entry.nutrition)) {
-                let val = parseFloat(v);
+                if (isServingSizeKey(k)) {
+                    nutrition[k] = v;
+                    continue;
+                }
+                const { value: val, unit } = parseNutrientValue(v);
                 if (!isNaN(val)) nutrition[k] = val;
+                if (unit) nutritionUnits[k] = unit;
             }
         } else if (isLink) {
             // Resolve the link the same way Obsidian itself would (handles a bare
@@ -521,12 +603,29 @@ async function renderMealsTable(dateStr) {
                 if (targetFm?.nutrition) {
                     nutrition = {};
                     for (let k of Object.keys(targetFm.nutrition)) {
-                        let val = parseFloat(targetFm.nutrition[k]);
+                        if (isServingSizeKey(k)) {
+                            nutrition[k] = targetFm.nutrition[k];
+                            continue;
+                        }
+                        const { value: val, unit } = parseNutrientValue(targetFm.nutrition[k]);
                         if (!isNaN(val)) nutrition[k] = val;
+                        if (unit) nutritionUnits[k] = unit;
                     }
                 } else {
                     let foodContent = await app.vault.read(targetFile);
-                    nutrition = parseNutritionFromText(foodContent);
+                    const parsedNutrition = parseNutritionFromText(foodContent);
+                    if (parsedNutrition) {
+                        nutrition = {};
+                        for (const [k, rawValue] of Object.entries(parsedNutrition)) {
+                            if (isServingSizeKey(k)) {
+                                nutrition[k] = rawValue;
+                                continue;
+                            }
+                            const { value, unit } = parseNutrientValue(rawValue);
+                            if (!isNaN(value)) nutrition[k] = value;
+                            if (unit) nutritionUnits[k] = unit;
+                        }
+                    }
                 }
             }
         }
@@ -538,7 +637,11 @@ async function renderMealsTable(dateStr) {
             name: display,
             rawFood: entry.food,
             servings: servings,
+            servingSize: "-",
             nutrients: {},
+            nutrientUnits: nutritionUnits,
+            nutrientIssues: {},
+            nutrientConversions: {},
             incomplete: !nutrition,
             isLink: isLink,
             // Raw (pre-serving-multiplication) nutrition, editable only for custom
@@ -548,13 +651,31 @@ async function renderMealsTable(dateStr) {
 
         if (nutrition) {
             for (let [k, v] of Object.entries(nutrition)) {
-                let normKey = k.toLowerCase().replace(/[-_]/g, ' ');
-                if (normKey === 'serving size') continue;
+                if (isServingSizeKey(k)) {
+                    foodRow.servingSize = String(v);
+                    continue;
+                }
 
                 allKeys.add(k);
-                let calculatedValue = v * servings;
+                const sourceUnit = nutritionUnits[k];
+                const headerUnit = unitMapping[k.toLowerCase()];
+                let valueForColumn = v;
+                let includeInTotal = true;
+
+                if (sourceUnit && headerUnit && sourceUnit !== normalizeUnit(headerUnit)) {
+                    const converted = convertUnit(v, sourceUnit, headerUnit);
+                    if (converted === null) {
+                        includeInTotal = false;
+                        foodRow.nutrientIssues[k] = `Cannot convert ${sourceUnit} to ${headerUnit}; excluded from total`;
+                    } else {
+                        valueForColumn = converted;
+                        foodRow.nutrientConversions[k] = `Converted from ${sourceUnit} to ${headerUnit}`;
+                    }
+                }
+
+                let calculatedValue = valueForColumn * servings;
                 foodRow.nutrients[k] = calculatedValue;
-                totals[k] = (totals[k] || 0) + calculatedValue;
+                if (includeInTotal) totals[k] = (totals[k] || 0) + calculatedValue;
             }
         }
 
@@ -586,7 +707,10 @@ async function renderMealsTable(dateStr) {
     headerRow.className = "table-view-tr-header";
     headerRow.appendChild(makeTh("Food"));
     headerRow.appendChild(makeTh("Servings"));
-    for (const k of keyArray) headerRow.appendChild(makeTh(formatHeader(k)));
+    for (const k of keyArray) {
+        headerRow.appendChild(makeTh(formatHeader(k)));
+        if (k.toLowerCase() === "calories") headerRow.appendChild(makeTh("Serving Size"));
+    }
     headerRow.appendChild(makeTh(""));
     thead.appendChild(headerRow);
     table.appendChild(thead);
@@ -598,7 +722,10 @@ async function renderMealsTable(dateStr) {
     totalsRow.style.backgroundColor = "var(--background-secondary)";
     totalsRow.appendChild(makeTd("TOTALS"));
     totalsRow.appendChild(makeTd("-"));
-    for (const k of keyArray) totalsRow.appendChild(makeTd((totals[k] || 0).toFixed(1)));
+    for (const k of keyArray) {
+        totalsRow.appendChild(makeTd((totals[k] || 0).toFixed(1)));
+        if (k.toLowerCase() === "calories") totalsRow.appendChild(makeTd("-"));
+    }
     totalsRow.appendChild(makeTd(""));
     tbody.appendChild(totalsRow);
 
@@ -674,16 +801,74 @@ async function renderMealsTable(dateStr) {
         return td;
     }
 
+    // `amount` is the number of product servings consumed. It is editable for
+    // linked products and one-off custom foods alike.
+    function buildServingsCell(food, entryIndex) {
+        const td = makeTd(String(food.servings));
+        td.style.cursor = "pointer";
+        td.title = "Click to edit servings consumed";
+
+        td.addEventListener("click", (e) => {
+            e.stopPropagation();
+            const inp = document.createElement("input");
+            inp.type = "number";
+            inp.step = "0.1";
+            inp.min = "0";
+            inp.value = String(food.servings);
+            inp.style.width = "70px";
+            styleInput(inp);
+            td.textContent = "";
+            td.appendChild(inp);
+            inp.focus();
+            inp.select();
+
+            let finished = false;
+            async function finish(save) {
+                if (finished) return;
+                finished = true;
+                const value = parseFloat(inp.value);
+                if (save && !isNaN(value) && value >= 0) {
+                    entries[entryIndex].amount = value;
+                    await rebuildTable();
+                    persistMeals();
+                } else {
+                    await rebuildTable();
+                }
+            }
+
+            inp.addEventListener("click", (e2) => e2.stopPropagation());
+            inp.addEventListener("keydown", (e2) => {
+                if (e2.key === "Enter") finish(true);
+                if (e2.key === "Escape") finish(false);
+            });
+            inp.addEventListener("blur", () => finish(true));
+        });
+
+        return td;
+    }
+
     function buildDisplayRow(food, entryIndex) {
         const tr = document.createElement("tr");
         tr.appendChild(buildFoodCell(food, entryIndex));
-        tr.appendChild(makeTd(String(food.servings)));
+        tr.appendChild(buildServingsCell(food, entryIndex));
         for (const k of keyArray) {
             let text;
             if (food.nutrients.hasOwnProperty(k)) text = food.nutrients[k].toFixed(1);
             else if (food.incomplete) text = "-";
             else text = "0.0";
-            tr.appendChild(makeTd(text));
+            if (food.nutrientIssues[k] && food.nutrientUnits[k]) {
+                text += ` ${food.nutrientUnits[k]}`;
+            }
+            const nutrientCell = makeTd(text);
+            if (food.nutrientIssues[k]) {
+                nutrientCell.style.color = "var(--text-error)";
+                nutrientCell.style.fontWeight = "bold";
+                nutrientCell.title = food.nutrientIssues[k];
+            } else if (food.nutrientConversions[k]) {
+                nutrientCell.title = food.nutrientConversions[k];
+            }
+            tr.appendChild(nutrientCell);
+            if (k.toLowerCase() === "calories") tr.appendChild(makeTd(food.servingSize));
         }
         tr.appendChild(buildRemoveCell(entryIndex));
 
@@ -708,7 +893,7 @@ async function renderMealsTable(dateStr) {
     function buildEditRow(food, entryIndex) {
         const tr = document.createElement("tr");
         tr.appendChild(buildFoodCell(food, entryIndex));
-        tr.appendChild(makeTd(String(food.servings)));
+        tr.appendChild(buildServingsCell(food, entryIndex));
 
         const editInputs = {};
         for (const k of keyArray) {
@@ -728,14 +913,18 @@ async function renderMealsTable(dateStr) {
                 cell.textContent = rawVal !== undefined ? rawVal : "-";
             }
             tr.appendChild(cell);
+            if (k.toLowerCase() === "calories") tr.appendChild(makeTd(food.servingSize));
         }
         tr.appendChild(buildRemoveCell(entryIndex));
 
         async function saveEdit() {
-            const nutrition = {};
+            // Preserve read-only/extra metadata (including serving size) while
+            // replacing the editable core nutrition values.
+            const nutrition = { ...food.rawNutrition };
             for (const [k, inp] of Object.entries(editInputs)) {
                 const val = parseFloat(inp.value);
                 if (!isNaN(val)) nutrition[k] = val;
+                else delete nutrition[k];
             }
             if (Object.keys(nutrition).length > 0) {
                 entries[entryIndex].nutrition = nutrition;
@@ -825,6 +1014,7 @@ async function renderMealsTable(dateStr) {
             cell.appendChild(inp);
         }
         addRow.appendChild(cell);
+        if (k.toLowerCase() === "calories") addRow.appendChild(makeTd(""));
     }
     addRow.appendChild(makeTd(""));
     tbody.appendChild(addRow);
