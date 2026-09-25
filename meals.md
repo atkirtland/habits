@@ -7,7 +7,14 @@
 window.__mealsWidgetState = window.__mealsWidgetState || {
     selectedDate: moment().format("YYYY-MM-DD"),
     foodSuggestions: null,
-    suggestionsBuiltAt: 0
+    suggestionsBuiltAt: 0,
+    // In-progress text in the "Add a food..." input, plus when it last lost
+    // focus. A self-triggered (or vault-wide) metadata change tears down and
+    // rebuilds this whole widget mid-keystroke, which blurs the input a beat
+    // before this script reruns — so a *recent* blur means "the rerun kicked
+    // me out", not "the user clicked away", and is worth restoring/refocusing.
+    pendingFoodText: "",
+    foodInputBlurredAt: 0
 };
 const mealsState = window.__mealsWidgetState;
 
@@ -354,14 +361,16 @@ function renderCalendar() {
 
     const prevBtn = document.createElement("button");
     prevBtn.textContent = "‹";
-    prevBtn.addEventListener("click", () => {
+    prevBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
         calendarViewMonth = calendarViewMonth.clone().subtract(1, "month");
         renderCalendar();
     });
 
     const nextBtn = document.createElement("button");
     nextBtn.textContent = "›";
-    nextBtn.addEventListener("click", () => {
+    nextBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
         calendarViewMonth = calendarViewMonth.clone().add(1, "month");
         renderCalendar();
     });
@@ -775,6 +784,23 @@ async function renderMealsTable(dateStr) {
     addRow.appendChild(foodCell);
     const addFoodLinkSuggest = attachLinkSuggest(foodInput, foodSuggestions);
 
+    // Restore text left mid-typing when a rerun (see the window state comment
+    // up top) tore this input down a moment ago, and pick up typing back up
+    // where it left off instead of leaving an empty box.
+    if (mealsState.pendingFoodText && Date.now() - mealsState.foodInputBlurredAt < 750) {
+        foodInput.value = mealsState.pendingFoodText;
+        setTimeout(() => {
+            foodInput.focus();
+            foodInput.setSelectionRange(foodInput.value.length, foodInput.value.length);
+        }, 0);
+    }
+    foodInput.addEventListener("input", () => {
+        mealsState.pendingFoodText = foodInput.value;
+    });
+    foodInput.addEventListener("blur", () => {
+        mealsState.foodInputBlurredAt = Date.now();
+    });
+
     const amountCell = document.createElement("td");
     const amountInput = document.createElement("input");
     amountInput.type = "number";
@@ -862,6 +888,7 @@ async function renderMealsTable(dateStr) {
         }
         if (Object.keys(nutrition).length > 0) newEntry.nutrition = nutrition;
 
+        mealsState.pendingFoodText = "";
         entries.push(newEntry);
         await rebuildTable();
         persistMeals();
