@@ -18,7 +18,7 @@ const mealsConfig = {
     mealsProperty: "meals",
     foodFolders: ["foods", "recipes"],
     foodExtensions: ["md", "cook"],
-    nutrientPriority: ["calories", "carbohydrates", "fat", "protein"],
+    nutrientPriority: ["calories", "carbohydrates", "fat", "protein", "sodium"],
     ...mealsInput,
     nutrientUnits: {
         ...DEFAULT_NUTRIENT_UNITS,
@@ -44,6 +44,7 @@ window.__mealsWidgetState = window.__mealsWidgetState || {
     foodInputBlurredAt: 0
 };
 const mealsState = window.__mealsWidgetState;
+mealsState.expandedNutrientGroups = mealsState.expandedNutrientGroups || {};
 
 // 1. Create a container for our UI
 const wrapper = dv.el("div", "");
@@ -150,6 +151,17 @@ const NUTRIENT_PRIORITY = mealsConfig.nutrientPriority;
 // Unit mappings for standard table headers
 const unitMapping = mealsConfig.nutrientUnits;
 
+function nutrientUnit(key) {
+    const normalized = key.toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(unitMapping, normalized)) {
+        return unitMapping[normalized];
+    }
+    if (["carbohydrates", "fat", "protein"].includes(normalized)) return "g";
+    const group = nutrientGroup(key);
+    if (group === "carbohydrates" || group === "fats") return "g";
+    return "mg";
+}
+
 // Helper function to parse *all* nutrition keys from raw text (frontmatter of a food/recipe file)
 function parseNutritionFromText(content) {
     const nutrition = {};
@@ -177,13 +189,52 @@ function parseNutritionFromText(content) {
 }
 
 // Helper function to capitalize headers and append units
-function formatHeader(key) {
-    let capitalized = key.toLowerCase() === "carbohydrates"
-        ? "Carbs"
-        : key.charAt(0).toUpperCase() + key.slice(1);
-    let unit = unitMapping[key.toLowerCase()];
-    return unit ? `${capitalized} (${unit})` : capitalized;
+function formatHeader(key, includeUnit = true) {
+    const vitaminName = key.match(/^vitamin[\s_-]+(.+)$/i)?.[1];
+    let capitalized = vitaminName
+        ? vitaminName.toUpperCase()
+        : key.toLowerCase() === "carbohydrates"
+            ? "Carbs"
+            : key.charAt(0).toUpperCase() + key.slice(1);
+    let unit = nutrientUnit(key);
+    return includeUnit && unit ? `${capitalized} (${unit})` : capitalized;
 }
+
+function formatSubnutrientHeader(key) {
+    const manuallyConfiguredUnits = mealsInput.nutrientUnits || {};
+    const hasManualUnit = Object.prototype.hasOwnProperty.call(manuallyConfiguredUnits, key.toLowerCase());
+    return formatHeader(key, hasManualUnit);
+}
+
+// Nutrient details are grouped for display only. Values remain independent:
+// child fats/carbohydrates are never summed to manufacture their parent value.
+function nutrientGroup(key) {
+    const normalized = key.toLowerCase().replace(/[-_]/g, " ").replace(/\s+/g, " ").trim();
+    if (/^(vitamin\b|retinol\b|thiamin(e)?\b|riboflavin\b|niacin\b|folate\b|folic acid\b|biotin\b)/.test(normalized)) {
+        return "vitamins";
+    }
+    if (/\b(saturated|monounsaturated|polyunsaturated|trans)\b/.test(normalized) && /\bfat(s)?\b/.test(normalized)) {
+        return "fats";
+    }
+    if (/\b(fiber|fibre|sugar|sugars|added sugar|sugar alcohol|starch|net carb)/.test(normalized)) {
+        return "carbohydrates";
+    }
+    const minerals = new Set([
+        "calcium", "chloride", "chromium", "copper", "iodine", "iron",
+        "magnesium", "manganese", "molybdenum", "phosphorus", "potassium",
+        "selenium", "sodium", "zinc", "salt"
+    ]);
+    if (minerals.has(normalized)) return "minerals";
+    return "other";
+}
+
+const NUTRIENT_GROUP_LABELS = {
+    carbohydrates: "Carbs",
+    fats: "Fat",
+    vitamins: "Vitamins",
+    minerals: "Minerals",
+    other: "Other"
+};
 
 // Fuzzy subsequence match: every character of `query` must appear in `text`, in
 // order (case-insensitive, ignoring spaces/hyphens/underscores on both sides), so
@@ -582,6 +633,16 @@ async function renderMealsTable(dateStr) {
     // refresh other views. The on-screen table is already up to date by the time
     // this runs (see rebuildTable below), so this doesn't gate the visible response.
     async function persistMeals() {
+        // Keep optional comments out of YAML unless they contain visible text.
+        for (const entry of entries) {
+            if (typeof entry.comment === "string") {
+                entry.comment = entry.comment.trim();
+                if (!entry.comment) delete entry.comment;
+            } else if (entry.comment != null) {
+                entry.comment = String(entry.comment).trim();
+                if (!entry.comment) delete entry.comment;
+            }
+        }
         await app.fileManager.processFrontMatter(file, (fm) => {
             fm[mealsConfig.mealsProperty] = entries;
         });
@@ -589,6 +650,12 @@ async function renderMealsTable(dateStr) {
     }
 
     async function rebuildTable() {
+    // Expanding/collapsing a nutrient group rebuilds the whole table. Preserve
+    // the scroll position from the container that is about to be replaced so a
+    // header click does not send the user back to the left edge (or the top).
+    const previousTableContainer = outputArea.querySelector(".meals-table-container");
+    const previousScrollLeft = previousTableContainer?.scrollLeft || 0;
+    const previousScrollTop = previousTableContainer?.scrollTop || 0;
     outputArea.innerHTML = "";
     let allKeys = new Set(NUTRIENT_PRIORITY);
     let foodsData = [];
@@ -653,6 +720,7 @@ async function renderMealsTable(dateStr) {
         const foodRow = {
             name: display,
             rawFood: entry.food,
+            comment: entry.comment == null ? "" : String(entry.comment),
             servings: servings,
             servingSize: "-",
             nutrients: {},
@@ -678,7 +746,7 @@ async function renderMealsTable(dateStr) {
 
                 allKeys.add(k);
                 const sourceUnit = nutritionUnits[k];
-                const headerUnit = unitMapping[k.toLowerCase()];
+                const headerUnit = nutrientUnit(k);
                 let valueForColumn = v;
                 let includeInTotal = true;
 
@@ -712,8 +780,30 @@ async function renderMealsTable(dateStr) {
         return a.localeCompare(b);
     });
 
+    const priorityKeys = keyArray.filter(k => NUTRIENT_PRIORITY.includes(k.toLowerCase()));
+    const groupedKeys = {
+        carbohydrates: [],
+        fats: [],
+        vitamins: [],
+        minerals: [],
+        other: []
+    };
+    for (const k of keyArray) {
+        if (!priorityKeys.includes(k)) groupedKeys[nutrientGroup(k)].push(k);
+    }
+
+    // When a macro's detail group is collapsed, its single group column can
+    // still repeat the total from the corresponding prioritized macro column.
+    // Respect custom nutrientPriority settings: no priority column means no
+    // duplicated group total.
+    const groupPriorityKeys = {
+        carbohydrates: priorityKeys.find(k => k.toLowerCase() === "carbohydrates"),
+        fats: priorityKeys.find(k => k.toLowerCase() === "fat")
+    };
+
     // 4. Build the table
     const tableContainer = document.createElement("div");
+    tableContainer.className = "meals-table-container";
     // Keep a long table within the viewport and make this the scroll container.
     // The header below can then remain visible during both vertical and
     // horizontal scrolling.
@@ -728,26 +818,64 @@ async function renderMealsTable(dateStr) {
     table.style.borderSpacing = "0";
 
     const thead = document.createElement("thead");
-    thead.style.position = "sticky";
-    thead.style.top = "0";
-    thead.style.zIndex = "10";
     thead.style.backgroundColor = "var(--background-secondary)";
-    thead.style.boxShadow = "0 3px 4px var(--background-primary)";
     const headerRow = document.createElement("tr");
+    const subheaderRow = document.createElement("tr");
     headerRow.className = "table-view-tr-header";
+    subheaderRow.className = "table-view-tr-header";
     headerRow.style.backgroundColor = "var(--background-secondary)";
-    headerRow.appendChild(makeTh("Food"));
-    headerRow.appendChild(makeTh("Servings"));
-    headerRow.appendChild(makeTh("Serving Size"));
-    for (const k of keyArray) {
-        headerRow.appendChild(makeTh(formatHeader(k)));
+    subheaderRow.style.backgroundColor = "var(--background-secondary)";
+    // Reserve the second header tier even while every category is collapsed.
+    // This prevents expanding a category from making the sticky area jump.
+    subheaderRow.style.height = "28px";
+
+    function appendFlatHeader(text) {
+        const th = makeTh(text);
+        th.rowSpan = 2;
+        headerRow.appendChild(th);
     }
-    headerRow.appendChild(makeTh(""));
-    for (const cell of headerRow.cells) {
-        cell.style.backgroundColor = "var(--background-secondary)";
-        cell.style.borderBottom = "0";
+
+    function appendGroupHeader(group) {
+        const keys = groupedKeys[group];
+        const expanded = Boolean(mealsState.expandedNutrientGroups[group]) && keys.length > 0;
+        const priorityKey = groupPriorityKeys[group];
+        const groupUnit = priorityKey ? nutrientUnit(priorityKey)
+            : (group === "carbohydrates" || group === "fats" ? "g" : "mg");
+        const label = `${NUTRIENT_GROUP_LABELS[group]} (${groupUnit})`;
+        const th = makeTh(`${label} ${expanded ? "▾" : "▸"}`);
+        th.style.cursor = "pointer";
+        th.title = `${expanded ? "Hide" : "Show"} ${NUTRIENT_GROUP_LABELS[group].toLowerCase()} fields`;
+        th.addEventListener("click", async () => {
+            mealsState.expandedNutrientGroups[group] = !mealsState.expandedNutrientGroups[group];
+            await rebuildTable();
+        });
+        if (expanded) {
+            th.colSpan = keys.length + (priorityKey ? 1 : 0);
+            if (priorityKey) subheaderRow.appendChild(makeTh(formatHeader(priorityKey, false)));
+            for (const k of keys) subheaderRow.appendChild(makeTh(formatSubnutrientHeader(k)));
+        } else {
+            th.rowSpan = 2;
+        }
+        headerRow.appendChild(th);
+    }
+
+    appendFlatHeader("Food");
+    appendFlatHeader("Servings");
+    appendFlatHeader("Serving Size");
+    for (const k of priorityKeys) {
+        appendFlatHeader(formatHeader(k));
+    }
+    appendFlatHeader("Comment");
+    for (const group of ["carbohydrates", "fats", "vitamins", "minerals", "other"]) appendGroupHeader(group);
+    appendFlatHeader("");
+    for (const row of [headerRow, subheaderRow]) {
+        for (const cell of row.cells) {
+            cell.style.backgroundColor = "var(--background-secondary)";
+            cell.style.borderBottom = "0";
+        }
     }
     thead.appendChild(headerRow);
+    thead.appendChild(subheaderRow);
     table.appendChild(thead);
 
     const tbody = document.createElement("tbody");
@@ -761,8 +889,19 @@ async function renderMealsTable(dateStr) {
     totalsRow.appendChild(makeTd("TOTALS"));
     totalsRow.appendChild(makeTd("-"));
     totalsRow.appendChild(makeTd("-"));
-    for (const k of keyArray) {
+    for (const k of priorityKeys) {
         totalsRow.appendChild(makeTd((totals[k] || 0).toFixed(1)));
+    }
+    totalsRow.appendChild(makeTd(""));
+    for (const group of ["carbohydrates", "fats", "vitamins", "minerals", "other"]) {
+        if (mealsState.expandedNutrientGroups[group] && groupedKeys[group].length > 0) {
+            const priorityKey = groupPriorityKeys[group];
+            if (priorityKey) totalsRow.appendChild(makeTd((totals[priorityKey] || 0).toFixed(1)));
+            for (const k of groupedKeys[group]) totalsRow.appendChild(makeTd((totals[k] || 0).toFixed(1)));
+        } else {
+            const priorityKey = groupPriorityKeys[group];
+            totalsRow.appendChild(makeTd(priorityKey ? (totals[priorityKey] || 0).toFixed(1) : ""));
+        }
     }
     totalsRow.appendChild(makeTd(""));
     // Obsidian themes may leave individual table cells transparent. Give every
@@ -849,6 +988,58 @@ async function renderMealsTable(dateStr) {
         return td;
     }
 
+    // Comments are optional for every kind of food entry. An empty edit removes
+    // the property entirely so blank comments are never serialized to YAML.
+    function buildCommentCell(food, entryIndex) {
+        const td = makeTd(food.comment);
+        td.style.cursor = "text";
+        td.style.maxWidth = "180px";
+        td.style.overflow = "hidden";
+        td.style.textOverflow = "ellipsis";
+        td.title = "Click to edit comment";
+
+        td.addEventListener("click", (e) => {
+            e.stopPropagation();
+            if (td.querySelector("input")) return;
+
+            const inp = document.createElement("input");
+            inp.type = "text";
+            inp.value = food.comment;
+            inp.placeholder = "Add a comment...";
+            inp.style.width = "100%";
+            inp.style.minWidth = "140px";
+            styleInput(inp);
+            td.textContent = "";
+            td.appendChild(inp);
+            inp.focus();
+            inp.select();
+
+            let finished = false;
+            async function finish(save) {
+                if (finished) return;
+                finished = true;
+                if (save) {
+                    const comment = inp.value.trim();
+                    if (comment) entries[entryIndex].comment = comment;
+                    else delete entries[entryIndex].comment;
+                    await rebuildTable();
+                    persistMeals();
+                } else {
+                    await rebuildTable();
+                }
+            }
+
+            inp.addEventListener("click", (e2) => e2.stopPropagation());
+            inp.addEventListener("keydown", (e2) => {
+                if (e2.key === "Enter") finish(true);
+                if (e2.key === "Escape") finish(false);
+            });
+            inp.addEventListener("blur", () => finish(true));
+        });
+
+        return td;
+    }
+
     // `amount` is the number of product servings consumed. It is editable for
     // linked products and one-off custom foods alike.
     function buildServingsCell(food, entryIndex) {
@@ -900,24 +1091,33 @@ async function renderMealsTable(dateStr) {
         tr.appendChild(buildFoodCell(food, entryIndex));
         tr.appendChild(buildServingsCell(food, entryIndex));
         tr.appendChild(makeTd(food.servingSize));
-        for (const k of keyArray) {
-            // An absent nutrient is unknown, not zero. Only display 0.0 when the
-            // source explicitly recorded a numeric zero for this nutrient.
-            let text = food.nutrients.hasOwnProperty(k)
-                ? food.nutrients[k].toFixed(1)
-                : "";
-            if (food.nutrientIssues[k] && food.nutrientUnits[k]) {
-                text += ` ${food.nutrientUnits[k]}`;
-            }
+
+        function appendNutrient(k) {
+            let text = food.nutrients.hasOwnProperty(k) ? food.nutrients[k].toFixed(1) : "";
+            if (food.nutrientIssues[k] && food.nutrientUnits[k]) text += ` ${food.nutrientUnits[k]}`;
             const nutrientCell = makeTd(text);
             if (food.nutrientIssues[k]) {
                 nutrientCell.style.color = "var(--text-error)";
                 nutrientCell.style.fontWeight = "bold";
                 nutrientCell.title = food.nutrientIssues[k];
-            } else if (food.nutrientConversions[k]) {
-                nutrientCell.title = food.nutrientConversions[k];
-            }
+            } else if (food.nutrientConversions[k]) nutrientCell.title = food.nutrientConversions[k];
             tr.appendChild(nutrientCell);
+        }
+
+        for (const k of priorityKeys) {
+            appendNutrient(k);
+        }
+        tr.appendChild(buildCommentCell(food, entryIndex));
+        for (const group of ["carbohydrates", "fats", "vitamins", "minerals", "other"]) {
+            if (mealsState.expandedNutrientGroups[group] && groupedKeys[group].length > 0) {
+                const priorityKey = groupPriorityKeys[group];
+                if (priorityKey) appendNutrient(priorityKey);
+                for (const k of groupedKeys[group]) appendNutrient(k);
+            } else {
+                const priorityKey = groupPriorityKeys[group];
+                if (priorityKey) appendNutrient(priorityKey);
+                else tr.appendChild(makeTd(""));
+            }
         }
         tr.appendChild(buildRemoveCell(entryIndex));
 
@@ -946,7 +1146,8 @@ async function renderMealsTable(dateStr) {
         tr.appendChild(makeTd(food.servingSize));
 
         const editInputs = {};
-        for (const k of keyArray) {
+        const mirroredEditInputs = [];
+        function appendNutrientInput(k) {
             const cell = document.createElement("td");
             const inp = document.createElement("input");
             inp.type = "number";
@@ -958,6 +1159,38 @@ async function renderMealsTable(dateStr) {
             editInputs[k] = inp;
             cell.appendChild(inp);
             tr.appendChild(cell);
+        }
+        function appendMirroredNutrientInput(k) {
+            const cell = document.createElement("td");
+            const inp = document.createElement("input");
+            inp.type = "number";
+            inp.step = "0.1";
+            inp.style.width = "70px";
+            styleInput(inp);
+            const sourceInput = editInputs[k];
+            inp.value = sourceInput?.value || "";
+            if (sourceInput) {
+                inp.addEventListener("input", () => { sourceInput.value = inp.value; });
+                sourceInput.addEventListener("input", () => { inp.value = sourceInput.value; });
+            }
+            mirroredEditInputs.push(inp);
+            cell.appendChild(inp);
+            tr.appendChild(cell);
+        }
+        for (const k of priorityKeys) {
+            appendNutrientInput(k);
+        }
+        tr.appendChild(buildCommentCell(food, entryIndex));
+        for (const group of ["carbohydrates", "fats", "vitamins", "minerals", "other"]) {
+            if (mealsState.expandedNutrientGroups[group] && groupedKeys[group].length > 0) {
+                const priorityKey = groupPriorityKeys[group];
+                if (priorityKey) appendMirroredNutrientInput(priorityKey);
+                for (const k of groupedKeys[group]) appendNutrientInput(k);
+            } else {
+                const priorityKey = groupPriorityKeys[group];
+                if (priorityKey) appendMirroredNutrientInput(priorityKey);
+                else tr.appendChild(makeTd(""));
+            }
         }
         tr.appendChild(buildRemoveCell(entryIndex));
 
@@ -979,7 +1212,7 @@ async function renderMealsTable(dateStr) {
             persistMeals();
         }
 
-        for (const inp of Object.values(editInputs)) {
+        for (const inp of [...Object.values(editInputs), ...mirroredEditInputs]) {
             inp.addEventListener("keydown", (e) => {
                 if (e.key === "Enter") saveEdit();
                 if (e.key === "Escape") rebuildTable();
@@ -1046,7 +1279,8 @@ async function renderMealsTable(dateStr) {
     addRow.appendChild(makeTd(""));
 
     const nutritionInputs = {};
-    for (const k of keyArray) {
+    const mirroredNutritionInputs = [];
+    function appendAddNutrientInput(k) {
         const cell = document.createElement("td");
         const inp = document.createElement("input");
         inp.type = "number";
@@ -1057,12 +1291,80 @@ async function renderMealsTable(dateStr) {
         cell.appendChild(inp);
         addRow.appendChild(cell);
     }
+    function appendMirroredAddNutrientInput(k) {
+        const cell = document.createElement("td");
+        const inp = document.createElement("input");
+        inp.type = "number";
+        inp.step = "0.1";
+        inp.style.width = "70px";
+        styleInput(inp);
+        const sourceInput = nutritionInputs[k];
+        inp.value = sourceInput?.value || "";
+        if (sourceInput) {
+            inp.addEventListener("input", () => { sourceInput.value = inp.value; });
+            sourceInput.addEventListener("input", () => { inp.value = sourceInput.value; });
+        }
+        mirroredNutritionInputs.push(inp);
+        cell.appendChild(inp);
+        addRow.appendChild(cell);
+    }
+    for (const k of priorityKeys) {
+        appendAddNutrientInput(k);
+    }
+
+    const commentCell = document.createElement("td");
+    const commentInput = document.createElement("input");
+    commentInput.type = "text";
+    commentInput.placeholder = "Comment...";
+    commentInput.style.width = "120px";
+    styleInput(commentInput);
+    commentCell.appendChild(commentInput);
+    addRow.appendChild(commentCell);
+
+    for (const group of ["carbohydrates", "fats", "vitamins", "minerals", "other"]) {
+        if (mealsState.expandedNutrientGroups[group] && groupedKeys[group].length > 0) {
+            const priorityKey = groupPriorityKeys[group];
+            if (priorityKey) appendMirroredAddNutrientInput(priorityKey);
+            for (const k of groupedKeys[group]) appendAddNutrientInput(k);
+        } else {
+            const priorityKey = groupPriorityKeys[group];
+            if (priorityKey) appendMirroredAddNutrientInput(priorityKey);
+            else addRow.appendChild(makeTd(""));
+        }
+    }
     addRow.appendChild(makeTd(""));
     tbody.appendChild(addRow);
 
     table.appendChild(tbody);
     tableContainer.appendChild(table);
     outputArea.appendChild(tableContainer);
+    tableContainer.scrollLeft = previousScrollLeft;
+    tableContainer.scrollTop = previousScrollTop;
+
+    // Chromium can flicker when an entire multi-row <thead> is sticky inside an
+    // overflow container. Stick its cells individually at measured row offsets
+    // instead, so the two header tiers and totals form one stable stack.
+    function positionStickyHeaderCells() {
+        const headerHeight = headerRow.getBoundingClientRect().height;
+        const subheaderHeight = subheaderRow.getBoundingClientRect().height;
+        for (const cell of headerRow.cells) {
+            cell.style.position = "sticky";
+            cell.style.top = "0px";
+            cell.style.zIndex = "13";
+        }
+        for (const cell of subheaderRow.cells) {
+            cell.style.position = "sticky";
+            cell.style.top = `${headerHeight}px`;
+            cell.style.zIndex = "12";
+        }
+        for (const cell of totalsRow.cells) {
+            cell.style.position = "sticky";
+            cell.style.top = `${headerHeight + subheaderHeight}px`;
+            cell.style.zIndex = "11";
+        }
+    }
+    positionStickyHeaderCells();
+    requestAnimationFrame(positionStickyHeaderCells);
 
     const addControls = document.createElement("div");
     addControls.style.display = "flex";
@@ -1111,6 +1413,8 @@ async function renderMealsTable(dateStr) {
         }
 
         const newEntry = { food: foodValue, amount: amount };
+        const comment = commentInput.value.trim();
+        if (comment) newEntry.comment = comment;
 
         const nutrition = {};
         for (const [key, inp] of Object.entries(nutritionInputs)) {
@@ -1134,8 +1438,11 @@ async function renderMealsTable(dateStr) {
     addButton.addEventListener("click", handleAddFood);
     const enterToAdd = (e) => { if (e.key === "Enter") handleAddFood(); };
     foodInput.addEventListener("keydown", (e) => { if (!addFoodLinkSuggest.isOpen()) enterToAdd(e); });
+    commentInput.addEventListener("keydown", enterToAdd);
     amountInput.addEventListener("keydown", enterToAdd);
-    for (const inp of Object.values(nutritionInputs)) inp.addEventListener("keydown", enterToAdd);
+    for (const inp of [...Object.values(nutritionInputs), ...mirroredNutritionInputs]) {
+        inp.addEventListener("keydown", enterToAdd);
+    }
     }
 
     await rebuildTable();
