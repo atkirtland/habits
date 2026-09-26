@@ -118,14 +118,13 @@ function convertUnit(value, sourceUnit, targetUnit) {
 }
 
 // Core nutrition fields always shown/available for inline custom entry
-const CORE_NUTRITION_KEYS = ["calories", "protein", "carbs", "fat"];
+const CORE_NUTRITION_KEYS = ["calories", "carbohydrates", "fat", "protein"];
 
 // Unit mappings for standard table headers
 const unitMapping = {
     calories: "kcal",
     fat: "g",
     carbohydrates: "g",
-    carbs: "g",
     protein: "g",
     sodium: "mg",
     cholesterol: "mg",
@@ -165,7 +164,9 @@ function parseNutritionFromText(content) {
 
 // Helper function to capitalize headers and append units
 function formatHeader(key) {
-    let capitalized = key.charAt(0).toUpperCase() + key.slice(1);
+    let capitalized = key.toLowerCase() === "carbohydrates"
+        ? "Carbs"
+        : key.charAt(0).toUpperCase() + key.slice(1);
     let unit = unitMapping[key.toLowerCase()];
     return unit ? `${capitalized} (${unit})` : capitalized;
 }
@@ -655,6 +656,9 @@ async function renderMealsTable(dateStr) {
                     foodRow.servingSize = String(v);
                     continue;
                 }
+                // "Carbs" is only the table's compact display label. Nutrition
+                // data is sourced exclusively from the "carbohydrates" field.
+                if (k.toLowerCase() === "carbs") continue;
 
                 allKeys.add(k);
                 const sourceUnit = nutritionUnits[k];
@@ -683,7 +687,7 @@ async function renderMealsTable(dateStr) {
     }
 
     // Convert keys to array and sort (prioritizing major macros first)
-    const priority = ['calories', 'fat', 'carbohydrates', 'carbs', 'protein'];
+    const priority = ['calories', 'carbohydrates', 'fat', 'protein', 'sodium'];
     let keyArray = Array.from(allKeys).sort((a, b) => {
         let idxA = priority.indexOf(a.toLowerCase());
         let idxB = priority.indexOf(b.toLowerCase());
@@ -707,9 +711,9 @@ async function renderMealsTable(dateStr) {
     headerRow.className = "table-view-tr-header";
     headerRow.appendChild(makeTh("Food"));
     headerRow.appendChild(makeTh("Servings"));
+    headerRow.appendChild(makeTh("Serving Size"));
     for (const k of keyArray) {
         headerRow.appendChild(makeTh(formatHeader(k)));
-        if (k.toLowerCase() === "calories") headerRow.appendChild(makeTh("Serving Size"));
     }
     headerRow.appendChild(makeTh(""));
     thead.appendChild(headerRow);
@@ -722,9 +726,9 @@ async function renderMealsTable(dateStr) {
     totalsRow.style.backgroundColor = "var(--background-secondary)";
     totalsRow.appendChild(makeTd("TOTALS"));
     totalsRow.appendChild(makeTd("-"));
+    totalsRow.appendChild(makeTd("-"));
     for (const k of keyArray) {
         totalsRow.appendChild(makeTd((totals[k] || 0).toFixed(1)));
-        if (k.toLowerCase() === "calories") totalsRow.appendChild(makeTd("-"));
     }
     totalsRow.appendChild(makeTd(""));
     tbody.appendChild(totalsRow);
@@ -851,11 +855,13 @@ async function renderMealsTable(dateStr) {
         const tr = document.createElement("tr");
         tr.appendChild(buildFoodCell(food, entryIndex));
         tr.appendChild(buildServingsCell(food, entryIndex));
+        tr.appendChild(makeTd(food.servingSize));
         for (const k of keyArray) {
-            let text;
-            if (food.nutrients.hasOwnProperty(k)) text = food.nutrients[k].toFixed(1);
-            else if (food.incomplete) text = "-";
-            else text = "0.0";
+            // An absent nutrient is unknown, not zero. Only display 0.0 when the
+            // source explicitly recorded a numeric zero for this nutrient.
+            let text = food.nutrients.hasOwnProperty(k)
+                ? food.nutrients[k].toFixed(1)
+                : "";
             if (food.nutrientIssues[k] && food.nutrientUnits[k]) {
                 text += ` ${food.nutrientUnits[k]}`;
             }
@@ -868,7 +874,6 @@ async function renderMealsTable(dateStr) {
                 nutrientCell.title = food.nutrientConversions[k];
             }
             tr.appendChild(nutrientCell);
-            if (k.toLowerCase() === "calories") tr.appendChild(makeTd(food.servingSize));
         }
         tr.appendChild(buildRemoveCell(entryIndex));
 
@@ -894,6 +899,7 @@ async function renderMealsTable(dateStr) {
         const tr = document.createElement("tr");
         tr.appendChild(buildFoodCell(food, entryIndex));
         tr.appendChild(buildServingsCell(food, entryIndex));
+        tr.appendChild(makeTd(food.servingSize));
 
         const editInputs = {};
         for (const k of keyArray) {
@@ -910,10 +916,9 @@ async function renderMealsTable(dateStr) {
                 cell.appendChild(inp);
             } else {
                 const rawVal = food.rawNutrition[k];
-                cell.textContent = rawVal !== undefined ? rawVal : "-";
+                cell.textContent = rawVal !== undefined ? rawVal : "";
             }
             tr.appendChild(cell);
-            if (k.toLowerCase() === "calories") tr.appendChild(makeTd(food.servingSize));
         }
         tr.appendChild(buildRemoveCell(entryIndex));
 
@@ -999,6 +1004,7 @@ async function renderMealsTable(dateStr) {
     styleInput(amountInput);
     amountCell.appendChild(amountInput);
     addRow.appendChild(amountCell);
+    addRow.appendChild(makeTd(""));
 
     const nutritionInputs = {};
     for (const k of keyArray) {
@@ -1014,7 +1020,6 @@ async function renderMealsTable(dateStr) {
             cell.appendChild(inp);
         }
         addRow.appendChild(cell);
-        if (k.toLowerCase() === "calories") addRow.appendChild(makeTd(""));
     }
     addRow.appendChild(makeTd(""));
     tbody.appendChild(addRow);
