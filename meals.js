@@ -714,16 +714,28 @@ async function renderMealsTable(dateStr) {
 
     // 4. Build the table
     const tableContainer = document.createElement("div");
-    tableContainer.style.overflowX = "auto";
+    // Keep a long table within the viewport and make this the scroll container.
+    // The header below can then remain visible during both vertical and
+    // horizontal scrolling.
+    tableContainer.style.maxHeight = "70vh";
+    tableContainer.style.overflow = "auto";
 
     const table = document.createElement("table");
     table.className = "dataview table-view-table";
     table.style.width = "100%";
     table.style.whiteSpace = "nowrap";
+    table.style.borderCollapse = "separate";
+    table.style.borderSpacing = "0";
 
     const thead = document.createElement("thead");
+    thead.style.position = "sticky";
+    thead.style.top = "0";
+    thead.style.zIndex = "10";
+    thead.style.backgroundColor = "var(--background-secondary)";
+    thead.style.boxShadow = "0 3px 4px var(--background-primary)";
     const headerRow = document.createElement("tr");
     headerRow.className = "table-view-tr-header";
+    headerRow.style.backgroundColor = "var(--background-secondary)";
     headerRow.appendChild(makeTh("Food"));
     headerRow.appendChild(makeTh("Servings"));
     headerRow.appendChild(makeTh("Serving Size"));
@@ -731,14 +743,21 @@ async function renderMealsTable(dateStr) {
         headerRow.appendChild(makeTh(formatHeader(k)));
     }
     headerRow.appendChild(makeTh(""));
+    for (const cell of headerRow.cells) {
+        cell.style.backgroundColor = "var(--background-secondary)";
+        cell.style.borderBottom = "0";
+    }
     thead.appendChild(headerRow);
     table.appendChild(thead);
 
     const tbody = document.createElement("tbody");
 
+    const totalsBackground = "color-mix(in srgb, var(--background-secondary) 50%, var(--background-primary))";
     const totalsRow = document.createElement("tr");
     totalsRow.style.fontWeight = "bold";
-    totalsRow.style.backgroundColor = "var(--background-secondary)";
+    totalsRow.style.backgroundColor = totalsBackground;
+    totalsRow.style.borderTop = "0";
+    totalsRow.style.borderBottom = "2px solid var(--background-modifier-border)";
     totalsRow.appendChild(makeTd("TOTALS"));
     totalsRow.appendChild(makeTd("-"));
     totalsRow.appendChild(makeTd("-"));
@@ -746,7 +765,17 @@ async function renderMealsTable(dateStr) {
         totalsRow.appendChild(makeTd((totals[k] || 0).toFixed(1)));
     }
     totalsRow.appendChild(makeTd(""));
-    tbody.appendChild(totalsRow);
+    // Obsidian themes may leave individual table cells transparent. Give every
+    // totals cell an opaque background so scrolling rows cannot show through
+    // the gaps between cells.
+    for (const cell of totalsRow.cells) {
+        cell.style.backgroundColor = totalsBackground;
+        cell.style.border = "0";
+        cell.style.borderBottom = "2px solid var(--background-modifier-border)";
+    }
+    // Keep totals together with the sticky column headings rather than letting
+    // them scroll away with the entry rows.
+    thead.appendChild(totalsRow);
 
     // Trailing cell with a "−" button that removes this entry from `meals`.
     function buildRemoveCell(entryIndex) {
