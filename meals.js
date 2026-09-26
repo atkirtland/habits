@@ -10,7 +10,21 @@ const DEFAULT_NUTRIENT_UNITS = {
     fiber: "g",
     potassium: "mg",
     calcium: "mg",
-    iron: "mg"
+    iron: "mg",
+    "vitamin a": "µg",
+    "vitamin b7": "µg",
+    "vitamin b9": "µg",
+    "vitamin b12": "µg",
+    "vitamin d": "µg",
+    "vitamin k": "µg",
+    retinol: "µg",
+    folate: "µg",
+    "folic acid": "µg",
+    biotin: "µg",
+    iodine: "µg",
+    selenium: "µg",
+    chromium: "µg",
+    molybdenum: "µg"
 };
 const mealsInput = input || {};
 const mealsConfig = {
@@ -152,7 +166,11 @@ const NUTRIENT_PRIORITY = mealsConfig.nutrientPriority;
 const unitMapping = mealsConfig.nutrientUnits;
 
 function nutrientUnit(key) {
-    const normalized = key.toLowerCase();
+    const exactKey = key.toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(unitMapping, exactKey)) {
+        return unitMapping[exactKey];
+    }
+    const normalized = exactKey.replace(/[-_]/g, " ").replace(/\s+/g, " ").trim();
     if (Object.prototype.hasOwnProperty.call(unitMapping, normalized)) {
         return unitMapping[normalized];
     }
@@ -201,9 +219,11 @@ function formatHeader(key, includeUnit = true) {
 }
 
 function formatSubnutrientHeader(key) {
-    const manuallyConfiguredUnits = mealsInput.nutrientUnits || {};
-    const hasManualUnit = Object.prototype.hasOwnProperty.call(manuallyConfiguredUnits, key.toLowerCase());
-    return formatHeader(key, hasManualUnit);
+    const group = nutrientGroup(key);
+    // Carbohydrate and fat details all use the unit shown on their group
+    // heading. The remaining groups can mix mg and µg, so show a unit on each
+    // individual subheading instead.
+    return formatHeader(key, group !== "carbohydrates" && group !== "fats");
 }
 
 // Nutrient details are grouped for display only. Values remain independent:
@@ -777,7 +797,9 @@ async function renderMealsTable(dateStr) {
         if (idxA !== -1 && idxB !== -1) return idxA - idxB;
         if (idxA !== -1) return -1;
         if (idxB !== -1) return 1;
-        return a.localeCompare(b);
+        // Sort numbered nutrients naturally (for example B1, B6, B12) rather
+        // than lexicographically, which would place B12 immediately after B1.
+        return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
     });
 
     const priorityKeys = keyArray.filter(k => NUTRIENT_PRIORITY.includes(k.toLowerCase()));
@@ -840,8 +862,10 @@ async function renderMealsTable(dateStr) {
         const expanded = Boolean(mealsState.expandedNutrientGroups[group]) && keys.length > 0;
         const priorityKey = groupPriorityKeys[group];
         const groupUnit = priorityKey ? nutrientUnit(priorityKey)
-            : (group === "carbohydrates" || group === "fats" ? "g" : "mg");
-        const label = `${NUTRIENT_GROUP_LABELS[group]} (${groupUnit})`;
+            : (group === "carbohydrates" || group === "fats" ? "g" : null);
+        const label = groupUnit
+            ? `${NUTRIENT_GROUP_LABELS[group]} (${groupUnit})`
+            : NUTRIENT_GROUP_LABELS[group];
         const th = makeTh(`${label} ${expanded ? "▾" : "▸"}`);
         th.style.cursor = "pointer";
         th.title = `${expanded ? "Hide" : "Show"} ${NUTRIENT_GROUP_LABELS[group].toLowerCase()} fields`;
