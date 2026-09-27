@@ -60,11 +60,39 @@ window.__mealsWidgetState = window.__mealsWidgetState || {
 const mealsState = window.__mealsWidgetState;
 mealsState.expandedNutrientGroups = mealsState.expandedNutrientGroups || {};
 
+// Dataview empties its own render container before executing a refreshed view.
+// Keep the interactive widget in a sibling host so that self-triggered refresh
+// cannot destroy its DOM before we decide whether it actually needs rebuilding.
+let persistentHost = mealsState.liveHost;
+if (!persistentHost?.isConnected || persistentHost.parentElement !== dv.container.parentElement) {
+    persistentHost = document.createElement("div");
+    persistentHost.className = "meals-persistent-host";
+    dv.container.before(persistentHost);
+    mealsState.liveHost = persistentHost;
+}
+dv.container.style.display = "none";
+
+// A frontmatter write makes Dataview execute this view again after its index
+// catches up. The handlers below have already updated the live table, so during
+// that short self-write window reattach the same DOM instead of rebuilding it.
+// Besides avoiding a visible flash, this preserves the mobile keyboard, focus,
+// and both scroll positions.
+const reuseLiveWrapper = mealsState.liveWrapper
+    && mealsState.suppressSelfWriteRerenderUntil > Date.now();
+
+if (reuseLiveWrapper) {
+    persistentHost.appendChild(mealsState.liveWrapper);
+} else {
+
 // 1. Create a container for our UI
-const wrapper = dv.el("div", "");
+// A genuine later refresh replaces the persistent widget with fresh vault data.
+persistentHost.innerHTML = "";
+const wrapper = document.createElement("div");
 wrapper.style.display = "flex";
 wrapper.style.flexDirection = "column";
 wrapper.style.gap = "15px";
+persistentHost.appendChild(wrapper);
+mealsState.liveWrapper = wrapper;
 
 function styleInput(el) {
     el.style.padding = "5px";
@@ -649,9 +677,9 @@ async function renderMealsTable(dateStr) {
     const storedEntries = fm?.[mealsConfig.mealsProperty];
     let entries = Array.isArray(storedEntries) ? storedEntries.map(e => ({ ...e })) : [];
 
-    // Persists the current in-memory `entries` to disk and asks Dataview to
-    // refresh other views. The on-screen table is already up to date by the time
-    // this runs (see rebuildTable below), so this doesn't gate the visible response.
+    // Persists the current in-memory `entries` to disk. Dataview notices the file
+    // change itself; explicitly requesting a vault-wide refresh here caused an
+    // additional delayed rebuild of this very table.
     async function persistMeals() {
         // Keep optional comments and consumption times out of YAML unless they
         // contain visible text.
@@ -671,10 +699,17 @@ async function renderMealsTable(dateStr) {
                 if (!entry.time) delete entry.time;
             }
         }
-        await app.fileManager.processFrontMatter(file, (fm) => {
-            fm[mealsConfig.mealsProperty] = entries;
-        });
-        app.workspace.trigger("dataview:refresh-views");
+        // Dataview's metadata refresh is asynchronous and can arrive several
+        // seconds after this write completes.
+        mealsState.suppressSelfWriteRerenderUntil = Date.now() + 15000;
+        try {
+            await app.fileManager.processFrontMatter(file, (fm) => {
+                fm[mealsConfig.mealsProperty] = entries;
+            });
+        } catch (error) {
+            mealsState.suppressSelfWriteRerenderUntil = 0;
+            throw error;
+        }
     }
 
     async function rebuildTable() {
@@ -1545,3 +1580,4 @@ async function renderMealsTable(dateStr) {
 
 // Initial render
 renderMealsTable(selectedDate);
+}

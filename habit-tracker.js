@@ -132,9 +132,8 @@ function showNotice(message) {
   setTimeout(() => notice.remove(), 6000);
 }
 
-// Tri-state boolean widget: blank (unset) is an empty square, left-click sets/clears true,
-// right-click sets/clears false — so "not done" (false) stays visually distinct from "not recorded" (blank).
-function triStateBox(parent, value, onChange) {
+// Tri-state boolean widget: left-click cycles blank (unset) -> true -> false -> blank.
+function triStateBox(parent, value, onChange, clickTarget = null) {
   let val = value === true ? true : value === false ? false : null;
   const box = parent.createEl("span", { attr: { style: "display:inline-flex;align-items:center;justify-content:center;width:1.4em;height:1.4em;border-radius:3px;font-weight:bold;line-height:1;cursor:pointer;user-select:none" }});
   const paint = () => {
@@ -144,13 +143,17 @@ function triStateBox(parent, value, onChange) {
     box.textContent = state.icon;
     box.style.color = state.color;
     box.style.border = `2px solid ${state.color}`;
-    box.title = val === true ? "True. Left-click to clear, right-click to mark false."
-      : val === false ? "False. Right-click to clear, left-click to mark true."
-      : "Blank. Left-click to mark true, right-click to mark false.";
+    box.title = val === true ? "True. Left-click to mark false."
+      : val === false ? "False. Left-click to clear."
+      : "Blank. Left-click to mark true.";
   };
   paint();
-  box.onclick = e => { e.stopPropagation(); val = val === true ? null : true; paint(); onChange(val); };
-  box.oncontextmenu = e => { e.preventDefault(); e.stopPropagation(); val = val === false ? null : false; paint(); onChange(val); };
+  (clickTarget || box).onclick = e => {
+    e.stopPropagation();
+    val = val === null ? true : val === true ? false : null;
+    paint();
+    onChange(val);
+  };
   return box;
 }
 
@@ -161,7 +164,7 @@ function typedInput(parent, label, type, value) {
   if (type === "boolean") {
     current = value === true ? true : value === false ? false : null;
     triStateBox(box, current, v => current = v);
-    box.createEl("small", { text: "Left-click: true. Right-click: false. Click the active state again to clear." });
+    box.createEl("small", { text: "Left-click to cycle: blank → true → false." });
   } else if (["text", "string-list", "number-list"].includes(type)) {
     input = box.createEl("textarea", { attr: { style: "width:100%;height:90px;font-family:var(--font-monospace);padding:8px" }});
     input.value = format(value);
@@ -251,15 +254,19 @@ function dataCell(td, day, item) {
   const value = field(day.page, item.key), goal = item.goalKey ? field(day.page, item.goalKey) : null;
   const invalid = validationError(value, item.statusType) || (item.goalType && validationError(goal, item.goalType));
   const done = completion(day.page, item);
-  const cell = td.createEl("div", { attr: { title: invalid || "Click to edit", style: `min-height:2em;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:4px;padding:4px;cursor:pointer;color:${invalid ? "var(--text-error)" : done ? "var(--text-success,#4caf50)" : "inherit"}` }});
+  const cell = td.createEl("div", { attr: { title: invalid || (item.statusType === "boolean" ? "Left-click to change status; right-click to edit" : "Right-click to edit"), style: `min-height:2em;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:4px;padding:4px;cursor:pointer;color:${invalid ? "var(--text-error)" : done ? "var(--text-success,#4caf50)" : "inherit"}` }});
   if (item.goalKey && present(goal)) cell.createEl("small", { text: `🎯 ${display(goal)}`, attr: { style: "opacity:.65" }});
   if (item.statusType === "boolean") {
-    triStateBox(cell, value, async v => { await updateFrontmatter(day.date, { [item.key]: v }); setTimeout(render, 300); });
+    triStateBox(cell, value, async v => { await updateFrontmatter(day.date, { [item.key]: v }); setTimeout(render, 300); }, cell);
   } else cell.createEl("div", { text: display(value), attr: { style: "font-size:.85em;word-break:break-word" }});
   if (invalid) cell.createEl("small", { text: "⚠ Invalid type" }); else if (item.goalKey && done) cell.createEl("small", { text: "✓" });
   cell.onmouseenter = () => cell.style.backgroundColor = "var(--background-modifier-hover)";
   cell.onmouseleave = () => cell.style.backgroundColor = "transparent";
-  cell.onclick = () => edit(day.date, day.page, item);
+  cell.oncontextmenu = event => {
+    event.preventDefault();
+    event.stopPropagation();
+    edit(day.date, day.page, item);
+  };
 }
 
 function habitTable(categories, weeks) {
