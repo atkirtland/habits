@@ -653,7 +653,8 @@ async function renderMealsTable(dateStr) {
     // refresh other views. The on-screen table is already up to date by the time
     // this runs (see rebuildTable below), so this doesn't gate the visible response.
     async function persistMeals() {
-        // Keep optional comments out of YAML unless they contain visible text.
+        // Keep optional comments and consumption times out of YAML unless they
+        // contain visible text.
         for (const entry of entries) {
             if (typeof entry.comment === "string") {
                 entry.comment = entry.comment.trim();
@@ -661,6 +662,13 @@ async function renderMealsTable(dateStr) {
             } else if (entry.comment != null) {
                 entry.comment = String(entry.comment).trim();
                 if (!entry.comment) delete entry.comment;
+            }
+            if (typeof entry.time === "string") {
+                entry.time = entry.time.trim();
+                if (!entry.time) delete entry.time;
+            } else if (entry.time != null) {
+                entry.time = String(entry.time).trim();
+                if (!entry.time) delete entry.time;
             }
         }
         await app.fileManager.processFrontMatter(file, (fm) => {
@@ -740,6 +748,7 @@ async function renderMealsTable(dateStr) {
         const foodRow = {
             name: display,
             rawFood: entry.food,
+            time: entry.time == null ? "" : String(entry.time),
             comment: entry.comment == null ? "" : String(entry.comment),
             servings: servings,
             servingSize: "-",
@@ -889,6 +898,7 @@ async function renderMealsTable(dateStr) {
     for (const k of priorityKeys) {
         appendFlatHeader(formatHeader(k));
     }
+    appendFlatHeader("Time");
     appendFlatHeader("Comment");
     for (const group of ["carbohydrates", "fats", "vitamins", "minerals", "other"]) appendGroupHeader(group);
     appendFlatHeader("");
@@ -916,6 +926,7 @@ async function renderMealsTable(dateStr) {
     for (const k of priorityKeys) {
         totalsRow.appendChild(makeTd((totals[k] || 0).toFixed(1)));
     }
+    totalsRow.appendChild(makeTd(""));
     totalsRow.appendChild(makeTd(""));
     for (const group of ["carbohydrates", "fats", "vitamins", "minerals", "other"]) {
         if (mealsState.expandedNutrientGroups[group] && groupedKeys[group].length > 0) {
@@ -1064,6 +1075,52 @@ async function renderMealsTable(dateStr) {
         return td;
     }
 
+    // Consumption time is optional and stored as a simple local HH:mm value.
+    // A native time input keeps entry consistent while remaining quick to edit.
+    function buildTimeCell(food, entryIndex) {
+        const td = makeTd(food.time);
+        td.style.cursor = "text";
+        td.title = "Click to edit time of consumption";
+
+        td.addEventListener("click", (e) => {
+            e.stopPropagation();
+            if (td.querySelector("input")) return;
+
+            const inp = document.createElement("input");
+            inp.type = "time";
+            inp.value = food.time;
+            inp.style.width = "110px";
+            styleInput(inp);
+            td.textContent = "";
+            td.appendChild(inp);
+            inp.focus();
+
+            let finished = false;
+            async function finish(save) {
+                if (finished) return;
+                finished = true;
+                if (save) {
+                    const time = inp.value.trim();
+                    if (time) entries[entryIndex].time = time;
+                    else delete entries[entryIndex].time;
+                    await rebuildTable();
+                    persistMeals();
+                } else {
+                    await rebuildTable();
+                }
+            }
+
+            inp.addEventListener("click", (e2) => e2.stopPropagation());
+            inp.addEventListener("keydown", (e2) => {
+                if (e2.key === "Enter") finish(true);
+                if (e2.key === "Escape") finish(false);
+            });
+            inp.addEventListener("blur", () => finish(true));
+        });
+
+        return td;
+    }
+
     // `amount` is the number of product servings consumed. It is editable for
     // linked products and one-off custom foods alike.
     function buildServingsCell(food, entryIndex) {
@@ -1131,6 +1188,7 @@ async function renderMealsTable(dateStr) {
         for (const k of priorityKeys) {
             appendNutrient(k);
         }
+        tr.appendChild(buildTimeCell(food, entryIndex));
         tr.appendChild(buildCommentCell(food, entryIndex));
         for (const group of ["carbohydrates", "fats", "vitamins", "minerals", "other"]) {
             if (mealsState.expandedNutrientGroups[group] && groupedKeys[group].length > 0) {
@@ -1204,6 +1262,7 @@ async function renderMealsTable(dateStr) {
         for (const k of priorityKeys) {
             appendNutrientInput(k);
         }
+        tr.appendChild(buildTimeCell(food, entryIndex));
         tr.appendChild(buildCommentCell(food, entryIndex));
         for (const group of ["carbohydrates", "fats", "vitamins", "minerals", "other"]) {
             if (mealsState.expandedNutrientGroups[group] && groupedKeys[group].length > 0) {
@@ -1336,6 +1395,15 @@ async function renderMealsTable(dateStr) {
         appendAddNutrientInput(k);
     }
 
+    const timeCell = document.createElement("td");
+    const timeInput = document.createElement("input");
+    timeInput.type = "time";
+    timeInput.title = "Time of consumption";
+    timeInput.style.width = "110px";
+    styleInput(timeInput);
+    timeCell.appendChild(timeInput);
+    addRow.appendChild(timeCell);
+
     const commentCell = document.createElement("td");
     const commentInput = document.createElement("input");
     commentInput.type = "text";
@@ -1437,6 +1505,8 @@ async function renderMealsTable(dateStr) {
         }
 
         const newEntry = { food: foodValue, amount: amount };
+        const time = timeInput.value.trim();
+        if (time) newEntry.time = time;
         const comment = commentInput.value.trim();
         if (comment) newEntry.comment = comment;
 
@@ -1462,6 +1532,7 @@ async function renderMealsTable(dateStr) {
     addButton.addEventListener("click", handleAddFood);
     const enterToAdd = (e) => { if (e.key === "Enter") handleAddFood(); };
     foodInput.addEventListener("keydown", (e) => { if (!addFoodLinkSuggest.isOpen()) enterToAdd(e); });
+    timeInput.addEventListener("keydown", enterToAdd);
     commentInput.addEventListener("keydown", enterToAdd);
     amountInput.addEventListener("keydown", enterToAdd);
     for (const inp of [...Object.values(nutritionInputs), ...mirroredNutritionInputs]) {
