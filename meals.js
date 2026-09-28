@@ -94,6 +94,26 @@ wrapper.style.gap = "15px";
 persistentHost.appendChild(wrapper);
 mealsState.liveWrapper = wrapper;
 
+// CSS also covers replacement cells created when editing a food name.
+const tableStyle = document.createElement("style");
+tableStyle.textContent = `
+    .meals-table > tbody > tr > td:first-child {
+        position: sticky;
+        left: 0;
+        z-index: 1;
+        background: var(--background-primary);
+    }
+    .meals-table > tbody > tr:hover > td:first-child {
+        background: var(--background-primary-alt);
+    }
+    .meals-table > tbody > tr > td:first-child,
+    .meals-table > thead > tr:first-child > th:first-child,
+    .meals-table > thead > tr:last-child > td:first-child {
+        box-shadow: 1px 0 0 var(--background-modifier-border);
+    }
+`;
+wrapper.appendChild(tableStyle);
+
 function styleInput(el) {
     el.style.padding = "5px";
     el.style.background = "var(--background-modifier-form-field)";
@@ -877,7 +897,7 @@ async function renderMealsTable(dateStr) {
     tableContainer.style.overflow = "auto";
 
     const table = document.createElement("table");
-    table.className = "dataview table-view-table";
+    table.className = "dataview table-view-table meals-table";
     table.style.width = "100%";
     table.style.whiteSpace = "nowrap";
     table.style.borderCollapse = "separate";
@@ -933,10 +953,7 @@ async function renderMealsTable(dateStr) {
     for (const k of priorityKeys) {
         appendFlatHeader(formatHeader(k));
     }
-    appendFlatHeader("Time");
-    appendFlatHeader("Comment");
     for (const group of ["carbohydrates", "fats", "vitamins", "minerals", "other"]) appendGroupHeader(group);
-    appendFlatHeader("");
     for (const row of [headerRow, subheaderRow]) {
         for (const cell of row.cells) {
             cell.style.backgroundColor = "var(--background-secondary)";
@@ -961,8 +978,6 @@ async function renderMealsTable(dateStr) {
     for (const k of priorityKeys) {
         totalsRow.appendChild(makeTd((totals[k] || 0).toFixed(1)));
     }
-    totalsRow.appendChild(makeTd(""));
-    totalsRow.appendChild(makeTd(""));
     for (const group of ["carbohydrates", "fats", "vitamins", "minerals", "other"]) {
         if (mealsState.expandedNutrientGroups[group] && groupedKeys[group].length > 0) {
             const priorityKey = groupPriorityKeys[group];
@@ -973,7 +988,6 @@ async function renderMealsTable(dateStr) {
             totalsRow.appendChild(makeTd(priorityKey ? (totals[priorityKey] || 0).toFixed(1) : ""));
         }
     }
-    totalsRow.appendChild(makeTd(""));
     // Obsidian themes may leave individual table cells transparent. Give every
     // totals cell an opaque background so scrolling rows cannot show through
     // the gaps between cells.
@@ -986,24 +1000,148 @@ async function renderMealsTable(dateStr) {
     // them scroll away with the entry rows.
     thead.appendChild(totalsRow);
 
-    // Trailing cell with a "−" button that removes this entry from `meals`.
-    function buildRemoveCell(entryIndex) {
-        const td = document.createElement("td");
-        const btn = document.createElement("button");
-        btn.textContent = "−";
-        btn.title = "Remove entry";
-        btn.style.color = "var(--text-error)";
-        btn.style.lineHeight = "1";
+    // Capture the entry itself so actions survive table rebuilds.
+    function attachMealMenu(row, entry, isDraft = false) {
+        row.tabIndex = 0;
+        row.setAttribute("aria-label", isDraft
+            ? "Add food; right-click for comment and time"
+            : "Meal row; right-click for comment, time, and delete");
 
-        btn.addEventListener("click", async (e) => {
-            e.stopPropagation();
-            entries.splice(entryIndex, 1);
-            await rebuildTable();
-            persistMeals();
+        function editField(key, label) {
+            const modal = document.createElement("dialog");
+            Object.assign(modal.style, {
+                width: "min(420px, calc(100vw - 40px))", padding: "20px",
+                border: "1px solid var(--background-modifier-border)", borderRadius: "8px",
+                color: "var(--text-normal)", background: "var(--background-primary)"
+            });
+            const heading = document.createElement("h2");
+            heading.textContent = label;
+            modal.appendChild(heading);
+            modal.setAttribute("aria-label", label);
+            modal.addEventListener("close", () => modal.remove(), { once: true });
+            const form = document.createElement("form");
+            const field = document.createElement("input");
+            field.type = key === "time" ? "time" : "text";
+            field.value = entry[key] == null ? "" : String(entry[key]);
+            field.setAttribute("aria-label", label);
+            field.style.width = "100%";
+            styleInput(field);
+            form.appendChild(field);
+            const hint = document.createElement("p");
+            hint.textContent = "Leave blank to clear this value.";
+            form.appendChild(hint);
+            const save = document.createElement("button");
+            save.type = "submit";
+            save.textContent = "Save";
+            save.className = "mod-cta";
+            form.appendChild(save);
+            const cancel = document.createElement("button");
+            cancel.type = "button";
+            cancel.textContent = "Cancel";
+            cancel.addEventListener("click", () => modal.close());
+            form.appendChild(cancel);
+            form.addEventListener("submit", async (event) => {
+                event.preventDefault();
+                if (!isDraft && !entries.includes(entry)) {
+                    modal.close();
+                    return;
+                }
+                const value = field.value.trim();
+                if (value) entry[key] = value;
+                else delete entry[key];
+                modal.close();
+                if (!isDraft) {
+                    await rebuildTable();
+                    await persistMeals();
+                }
+            });
+            modal.appendChild(form);
+            document.body.appendChild(modal);
+            modal.showModal();
+            field.focus();
+        }
+
+        function showMenu(position) {
+            const menu = document.createElement("dialog");
+            menu.setAttribute("role", "menu");
+            menu.setAttribute("aria-label", "Meal actions");
+            Object.assign(menu.style, {
+                position: "fixed", margin: "0", padding: "4px",
+                maxWidth: "min(420px, calc(100vw - 16px))",
+                border: "1px solid var(--background-modifier-border)", borderRadius: "6px",
+                color: "var(--text-normal)", background: "var(--background-primary)",
+                boxShadow: "0 2px 12px rgba(0,0,0,.3)"
+            });
+            function addAction(label, action, destructive = false) {
+                const button = document.createElement("button");
+                button.type = "button";
+                button.textContent = label;
+                button.setAttribute("role", "menuitem");
+                Object.assign(button.style, {
+                    display: "block", width: "100%", textAlign: "left",
+                    whiteSpace: "normal", height: "auto", padding: "8px 12px",
+                    boxShadow: "none", border: "0"
+                });
+                if (destructive) button.style.color = "var(--text-error)";
+                button.addEventListener("click", () => {
+                    menu.close();
+                    action();
+                });
+                menu.appendChild(button);
+            }
+            addAction(entry.comment ? "Comment: " + entry.comment : "Add comment…",
+                () => editField("comment", "Edit comment"));
+            addAction(entry.time ? "Time: " + entry.time : "Set time…",
+                () => editField("time", "Time of consumption"));
+            if (!isDraft) {
+                addAction("Delete meal", async () => {
+                    const index = entries.indexOf(entry);
+                    if (index === -1) return;
+                    entries.splice(index, 1);
+                    await rebuildTable();
+                    await persistMeals();
+                }, true);
+            }
+            menu.addEventListener("close", () => menu.remove(), { once: true });
+            menu.addEventListener("click", event => {
+                if (event.target === menu) menu.close();
+            });
+            menu.addEventListener("contextmenu", event => {
+                event.preventDefault();
+                menu.close();
+            });
+            menu.addEventListener("keydown", event => {
+                const buttons = Array.from(menu.querySelectorAll("button"));
+                const index = buttons.indexOf(document.activeElement);
+                let next;
+                if (event.key === "ArrowDown") next = (index + 1) % buttons.length;
+                if (event.key === "ArrowUp") next = (index - 1 + buttons.length) % buttons.length;
+                if (event.key === "Home") next = 0;
+                if (event.key === "End") next = buttons.length - 1;
+                if (next !== undefined) {
+                    event.preventDefault();
+                    buttons[next].focus();
+                }
+            });
+            document.body.appendChild(menu);
+            menu.showModal();
+            const rect = menu.getBoundingClientRect();
+            menu.style.left = Math.max(8, Math.min(position.x, window.innerWidth - rect.width - 8)) + "px";
+            menu.style.top = Math.max(8, Math.min(position.y, window.innerHeight - rect.height - 8)) + "px";
+        }
+
+        row.addEventListener("contextmenu", event => {
+            event.preventDefault();
+            event.stopPropagation();
+            showMenu({ x: event.clientX, y: event.clientY });
         });
-
-        td.appendChild(btn);
-        return td;
+        row.addEventListener("keydown", event => {
+            if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+            event.preventDefault();
+            event.stopPropagation();
+            const rect = row.getBoundingClientRect();
+            showMenu({ x: rect.left, y: rect.bottom });
+        });
     }
 
     // Food-name cell, editable independently of the nutrition-edit row: click it to
@@ -1058,104 +1196,6 @@ async function renderMealsTable(dateStr) {
         return td;
     }
 
-    // Comments are optional for every kind of food entry. An empty edit removes
-    // the property entirely so blank comments are never serialized to YAML.
-    function buildCommentCell(food, entryIndex) {
-        const td = makeTd(food.comment);
-        td.style.cursor = "text";
-        td.style.maxWidth = "180px";
-        td.style.overflow = "hidden";
-        td.style.textOverflow = "ellipsis";
-        td.title = "Click to edit comment";
-
-        td.addEventListener("click", (e) => {
-            e.stopPropagation();
-            if (td.querySelector("input")) return;
-
-            const inp = document.createElement("input");
-            inp.type = "text";
-            inp.value = food.comment;
-            inp.placeholder = "Add a comment...";
-            inp.style.width = "100%";
-            inp.style.minWidth = "140px";
-            styleInput(inp);
-            td.textContent = "";
-            td.appendChild(inp);
-            inp.focus();
-            inp.select();
-
-            let finished = false;
-            async function finish(save) {
-                if (finished) return;
-                finished = true;
-                if (save) {
-                    const comment = inp.value.trim();
-                    if (comment) entries[entryIndex].comment = comment;
-                    else delete entries[entryIndex].comment;
-                    await rebuildTable();
-                    persistMeals();
-                } else {
-                    await rebuildTable();
-                }
-            }
-
-            inp.addEventListener("click", (e2) => e2.stopPropagation());
-            inp.addEventListener("keydown", (e2) => {
-                if (e2.key === "Enter") finish(true);
-                if (e2.key === "Escape") finish(false);
-            });
-            inp.addEventListener("blur", () => finish(true));
-        });
-
-        return td;
-    }
-
-    // Consumption time is optional and stored as a simple local HH:mm value.
-    // A native time input keeps entry consistent while remaining quick to edit.
-    function buildTimeCell(food, entryIndex) {
-        const td = makeTd(food.time);
-        td.style.cursor = "text";
-        td.title = "Click to edit time of consumption";
-
-        td.addEventListener("click", (e) => {
-            e.stopPropagation();
-            if (td.querySelector("input")) return;
-
-            const inp = document.createElement("input");
-            inp.type = "time";
-            inp.value = food.time;
-            inp.style.width = "110px";
-            styleInput(inp);
-            td.textContent = "";
-            td.appendChild(inp);
-            inp.focus();
-
-            let finished = false;
-            async function finish(save) {
-                if (finished) return;
-                finished = true;
-                if (save) {
-                    const time = inp.value.trim();
-                    if (time) entries[entryIndex].time = time;
-                    else delete entries[entryIndex].time;
-                    await rebuildTable();
-                    persistMeals();
-                } else {
-                    await rebuildTable();
-                }
-            }
-
-            inp.addEventListener("click", (e2) => e2.stopPropagation());
-            inp.addEventListener("keydown", (e2) => {
-                if (e2.key === "Enter") finish(true);
-                if (e2.key === "Escape") finish(false);
-            });
-            inp.addEventListener("blur", () => finish(true));
-        });
-
-        return td;
-    }
-
     // `amount` is the number of product servings consumed. It is editable for
     // linked products and one-off custom foods alike.
     function buildServingsCell(food, entryIndex) {
@@ -1204,6 +1244,7 @@ async function renderMealsTable(dateStr) {
 
     function buildDisplayRow(food, entryIndex) {
         const tr = document.createElement("tr");
+        attachMealMenu(tr, entries[entryIndex]);
         tr.appendChild(buildFoodCell(food, entryIndex));
         tr.appendChild(buildServingsCell(food, entryIndex));
         tr.appendChild(makeTd(food.servingSize));
@@ -1223,8 +1264,6 @@ async function renderMealsTable(dateStr) {
         for (const k of priorityKeys) {
             appendNutrient(k);
         }
-        tr.appendChild(buildTimeCell(food, entryIndex));
-        tr.appendChild(buildCommentCell(food, entryIndex));
         for (const group of ["carbohydrates", "fats", "vitamins", "minerals", "other"]) {
             if (mealsState.expandedNutrientGroups[group] && groupedKeys[group].length > 0) {
                 const priorityKey = groupPriorityKeys[group];
@@ -1236,7 +1275,6 @@ async function renderMealsTable(dateStr) {
                 else tr.appendChild(makeTd(""));
             }
         }
-        tr.appendChild(buildRemoveCell(entryIndex));
 
         if (!food.isLink) {
             tr.style.cursor = "pointer";
@@ -1258,6 +1296,7 @@ async function renderMealsTable(dateStr) {
     // inline nutrition values directly from the table.
     function buildEditRow(food, entryIndex) {
         const tr = document.createElement("tr");
+        attachMealMenu(tr, entries[entryIndex]);
         tr.appendChild(buildFoodCell(food, entryIndex));
         tr.appendChild(buildServingsCell(food, entryIndex));
         tr.appendChild(makeTd(food.servingSize));
@@ -1297,8 +1336,6 @@ async function renderMealsTable(dateStr) {
         for (const k of priorityKeys) {
             appendNutrientInput(k);
         }
-        tr.appendChild(buildTimeCell(food, entryIndex));
-        tr.appendChild(buildCommentCell(food, entryIndex));
         for (const group of ["carbohydrates", "fats", "vitamins", "minerals", "other"]) {
             if (mealsState.expandedNutrientGroups[group] && groupedKeys[group].length > 0) {
                 const priorityKey = groupPriorityKeys[group];
@@ -1310,9 +1347,11 @@ async function renderMealsTable(dateStr) {
                 else tr.appendChild(makeTd(""));
             }
         }
-        tr.appendChild(buildRemoveCell(entryIndex));
 
+        let editFinished = false;
         async function saveEdit() {
+            if (editFinished || !tr.isConnected) return;
+            editFinished = true;
             // Preserve metadata outside the displayed nutrient columns (including
             // serving size) while replacing the editable displayed values.
             const nutrition = { ...food.rawNutrition };
@@ -1430,23 +1469,8 @@ async function renderMealsTable(dateStr) {
         appendAddNutrientInput(k);
     }
 
-    const timeCell = document.createElement("td");
-    const timeInput = document.createElement("input");
-    timeInput.type = "time";
-    timeInput.title = "Time of consumption";
-    timeInput.style.width = "110px";
-    styleInput(timeInput);
-    timeCell.appendChild(timeInput);
-    addRow.appendChild(timeCell);
-
-    const commentCell = document.createElement("td");
-    const commentInput = document.createElement("input");
-    commentInput.type = "text";
-    commentInput.placeholder = "Comment...";
-    commentInput.style.width = "120px";
-    styleInput(commentInput);
-    commentCell.appendChild(commentInput);
-    addRow.appendChild(commentCell);
+    const draftMetadata = {};
+    attachMealMenu(addRow, draftMetadata, true);
 
     for (const group of ["carbohydrates", "fats", "vitamins", "minerals", "other"]) {
         if (mealsState.expandedNutrientGroups[group] && groupedKeys[group].length > 0) {
@@ -1459,7 +1483,6 @@ async function renderMealsTable(dateStr) {
             else addRow.appendChild(makeTd(""));
         }
     }
-    addRow.appendChild(makeTd(""));
     tbody.appendChild(addRow);
 
     table.appendChild(tbody);
@@ -1489,6 +1512,12 @@ async function renderMealsTable(dateStr) {
             cell.style.top = `${headerHeight + subheaderHeight}px`;
             cell.style.zIndex = "11";
         }
+        // These intersections stick in both directions and cover the other
+        // cells in their header tier during horizontal scrolling.
+        headerRow.cells[0].style.left = "0px";
+        headerRow.cells[0].style.zIndex = "14";
+        totalsRow.cells[0].style.left = "0px";
+        totalsRow.cells[0].style.zIndex = "12";
     }
     positionStickyHeaderCells();
     requestAnimationFrame(positionStickyHeaderCells);
@@ -1539,11 +1568,7 @@ async function renderMealsTable(dateStr) {
             }
         }
 
-        const newEntry = { food: foodValue, amount: amount };
-        const time = timeInput.value.trim();
-        if (time) newEntry.time = time;
-        const comment = commentInput.value.trim();
-        if (comment) newEntry.comment = comment;
+        const newEntry = { food: foodValue, amount: amount, ...draftMetadata };
 
         const nutrition = {};
         for (const [key, inp] of Object.entries(nutritionInputs)) {
@@ -1567,8 +1592,6 @@ async function renderMealsTable(dateStr) {
     addButton.addEventListener("click", handleAddFood);
     const enterToAdd = (e) => { if (e.key === "Enter") handleAddFood(); };
     foodInput.addEventListener("keydown", (e) => { if (!addFoodLinkSuggest.isOpen()) enterToAdd(e); });
-    timeInput.addEventListener("keydown", enterToAdd);
-    commentInput.addEventListener("keydown", enterToAdd);
     amountInput.addEventListener("keydown", enterToAdd);
     for (const inp of [...Object.values(nutritionInputs), ...mirroredNutritionInputs]) {
         inp.addEventListener("keydown", enterToAdd);
