@@ -86,6 +86,7 @@ if (reuseLiveWrapper) {
 
 // 1. Create a container for our UI
 // A genuine later refresh replaces the persistent widget with fresh vault data.
+mealsState.cleanupSuggestions?.();
 persistentHost.innerHTML = "";
 const wrapper = document.createElement("div");
 wrapper.style.display = "flex";
@@ -338,6 +339,18 @@ function resolveFoodLink(foodStr) {
     return { target: foodStr, display: foodStr, isLink: false };
 }
 
+// Obsidian assumes ".md" for an extensionless link, so "[[recipes/name]]" never
+// reaches "recipes/name.cook". Fall back to each configured food extension.
+function resolveFoodFile(target, sourcePath) {
+    const direct = app.metadataCache.getFirstLinkpathDest(target, sourcePath);
+    if (direct) return direct;
+    for (const ext of mealsConfig.foodExtensions) {
+        const candidate = app.metadataCache.getFirstLinkpathDest(`${target}.${ext}`, sourcePath);
+        if (candidate) return candidate;
+    }
+    return null;
+}
+
 // Suggestions for the "add food" autocomplete, keyed by alias since filenames are sluggified
 function getFoodSuggestions() {
     const validExtensions = mealsConfig.foodExtensions;
@@ -370,60 +383,94 @@ if (!mealsState.foodSuggestions || Date.now() - mealsState.suggestionsBuiltAt > 
 }
 const foodSuggestions = mealsState.foodSuggestions;
 
-const foodDatalist = document.createElement("datalist");
-foodDatalist.id = "meals-food-datalist";
-for (const s of foodSuggestions) {
-    const opt = document.createElement("option");
-    opt.value = s.alias;
-    foodDatalist.appendChild(opt);
-}
-wrapper.appendChild(foodDatalist);
+// Use one controlled popup for both plain names and [[links]]. Native datalist
+// popups cannot be positioned around Android's keyboard.
+const suggestionCleanups = new Set();
+mealsState.cleanupSuggestions = () => {
+    for (const cleanup of [...suggestionCleanups]) cleanup();
+};
 
-// Watches a text input for a "[[" trigger and shows a filtered dropdown of the
-// given suggestions (matched by alias) below it, like Obsidian's native link
-// autocomplete. Selecting an entry inserts "[[path]]" or "[[path|alias]]" in its
-// place. The dropdown is fixed-positioned off the real DOM (not the input's
-// parent), so it can't get clipped by an ancestor's overflow (e.g. the table's
-// scroll wrapper).
 function attachLinkSuggest(inputEl, suggestionsList) {
+    inputEl.autocomplete = "off";
+    inputEl.spellcheck = false;
+    inputEl.setAttribute("autocorrect", "off");
+    inputEl.setAttribute("autocapitalize", "off");
+    inputEl.setAttribute("role", "combobox");
+    inputEl.setAttribute("aria-autocomplete", "list");
+    inputEl.setAttribute("aria-expanded", "false");
     const dropdown = document.createElement("div");
-    dropdown.style.position = "fixed";
-    dropdown.style.zIndex = "200";
-    dropdown.style.background = "var(--background-primary)";
-    dropdown.style.border = "1px solid var(--background-modifier-border)";
-    dropdown.style.borderRadius = "4px";
-    dropdown.style.maxHeight = "200px";
-    dropdown.style.overflowY = "auto";
-    dropdown.style.display = "none";
-    dropdown.style.minWidth = "200px";
-    dropdown.style.boxShadow = "0 2px 8px rgba(0, 0, 0, 0.3)";
+    dropdown.id = "meals-suggestions-" + Math.random().toString(36).slice(2);
+    dropdown.setAttribute("role", "listbox");
+    inputEl.setAttribute("aria-controls", dropdown.id);
+    Object.assign(dropdown.style, {
+        position: "fixed", zIndex: "200",
+        background: "var(--background-primary)",
+        border: "1px solid var(--background-modifier-border)",
+        borderRadius: "4px", overflowY: "auto", display: "none",
+        boxSizing: "border-box", overscrollBehavior: "contain",
+        touchAction: "pan-y", boxShadow: "0 2px 8px rgba(0, 0, 0, 0.3)"
+    });
     document.body.appendChild(dropdown);
 
     let activeIndex = -1;
     let currentMatches = [];
     let linkStart = -1;
-
-    function positionDropdown() {
-        const rect = inputEl.getBoundingClientRect();
-        dropdown.style.left = `${rect.left}px`;
-        dropdown.style.top = `${rect.bottom + 2}px`;
-        dropdown.style.minWidth = `${rect.width}px`;
-    }
+    let composing = false;
+    let blurTimer;
+    let disposed = false;
 
     function closeDropdown() {
         dropdown.style.display = "none";
         dropdown.innerHTML = "";
+        inputEl.setAttribute("aria-expanded", "false");
+        inputEl.removeAttribute("aria-activedescendant");
         activeIndex = -1;
         currentMatches = [];
         linkStart = -1;
     }
 
+    function positionDropdown() {
+        if (dropdown.style.display === "none") return;
+        if (!inputEl.isConnected) {
+            cleanup();
+            return;
+        }
+        const rect = inputEl.getBoundingClientRect();
+        const viewport = window.visualViewport;
+        const left = (viewport?.offsetLeft || 0) + 8;
+        const top = (viewport?.offsetTop || 0) + 8;
+        const right = left + (viewport?.width || window.innerWidth) - 16;
+        const bottom = top + (viewport?.height || window.innerHeight) - 16;
+        const below = Math.max(0, bottom - rect.bottom - 4);
+        const above = Math.max(0, rect.top - top - 4);
+        const placeAbove = below < 160 && above > below;
+        const space = placeAbove ? above : below;
+        // Do not cover the field if neither side has room for a touch target.
+        if (space < 44 || rect.bottom < top || rect.top > bottom
+            || rect.right < left || rect.left > right) {
+            closeDropdown();
+            return;
+        }
+        const width = Math.min(Math.max(rect.width, 240), right - left);
+        dropdown.style.width = width + "px";
+        dropdown.style.maxHeight = Math.min(240, space) + "px";
+        dropdown.style.left = Math.max(left, Math.min(rect.left, right - width)) + "px";
+        dropdown.style.top = (placeAbove
+            ? rect.top - 4 - dropdown.getBoundingClientRect().height
+            : rect.bottom + 4) + "px";
+    }
+
     function selectMatch(match) {
-        const before = inputEl.value.slice(0, linkStart);
-        const linkText = match.path === match.alias ? `[[${match.path}]]` : `[[${match.path}|${match.alias}]]`;
+        const before = linkStart >= 0 ? inputEl.value.slice(0, linkStart) : "";
+        const linkText = match.path === match.alias
+            ? "[[" + match.path + "]]"
+            : "[[" + match.path + "|" + match.alias + "]]";
         inputEl.value = before + linkText;
         closeDropdown();
-        inputEl.focus();
+        clearTimeout(blurTimer);
+        inputEl.focus({ preventScroll: true });
+        // Keep the add-food draft in sync with programmatic selections.
+        inputEl.dispatchEvent(new Event("input", { bubbles: true }));
     }
 
     function renderDropdown() {
@@ -432,36 +479,41 @@ function attachLinkSuggest(inputEl, suggestionsList) {
             closeDropdown();
             return;
         }
-        currentMatches.forEach((m, i) => {
+        currentMatches.forEach((match, index) => {
             const item = document.createElement("div");
-            item.textContent = m.alias;
-            item.style.padding = "4px 8px";
-            item.style.cursor = "pointer";
-            item.style.backgroundColor = i === activeIndex ? "var(--background-modifier-hover)" : "";
-            item.addEventListener("mousedown", (e) => {
-                e.preventDefault();
-                selectMatch(m);
+            item.id = dropdown.id + "-" + index;
+            item.setAttribute("role", "option");
+            item.setAttribute("aria-selected", String(index === activeIndex));
+            item.textContent = match.alias;
+            Object.assign(item.style, {
+                padding: "10px 12px", minHeight: "44px", boxSizing: "border-box",
+                whiteSpace: "normal", overflowWrap: "anywhere", cursor: "pointer",
+                backgroundColor: index === activeIndex ? "var(--background-modifier-hover)" : ""
             });
+            // Keep focus/keyboard on the input; select on click so swiping the
+            // list does not accidentally choose the first item touched.
+            item.addEventListener("pointerdown", event => event.preventDefault());
+            item.addEventListener("click", () => selectMatch(match));
             dropdown.appendChild(item);
         });
-        positionDropdown();
         dropdown.style.display = "block";
+        inputEl.setAttribute("aria-expanded", "true");
+        inputEl.setAttribute("aria-activedescendant", dropdown.id + "-" + activeIndex);
+        positionDropdown();
+        const active = dropdown.children[activeIndex];
+        if (active) dropdown.scrollTop = Math.max(0, active.offsetTop - dropdown.clientHeight + active.offsetHeight);
     }
 
-    inputEl.addEventListener("input", () => {
-        const val = inputEl.value;
-        const idx = val.lastIndexOf("[[");
-        if (idx === -1) {
+    function updateMatches() {
+        if (disposed || composing) return;
+        const value = inputEl.value;
+        const index = value.lastIndexOf("[[");
+        const query = index >= 0 ? value.slice(index + 2) : value.trim();
+        if ((index < 0 && !query) || query.includes("]]")) {
             closeDropdown();
             return;
         }
-        const afterOpen = val.slice(idx + 2);
-        if (afterOpen.includes("]]")) {
-            closeDropdown();
-            return;
-        }
-        linkStart = idx;
-        const query = afterOpen;
+        linkStart = index;
         currentMatches = suggestionsList
             .map(s => ({ s, score: fuzzyScore(query, s.alias) }))
             .filter(m => m.score !== null)
@@ -470,42 +522,62 @@ function attachLinkSuggest(inputEl, suggestionsList) {
             .map(m => m.s);
         activeIndex = currentMatches.length > 0 ? 0 : -1;
         renderDropdown();
-    });
+    }
 
-    // Registered before any caller-added keydown listener, and stops immediate
-    // propagation on a handled key so a selection/navigation keystroke can't also
-    // reach a later listener (e.g. an "Enter to save/submit" handler) on the same input.
-    inputEl.addEventListener("keydown", (e) => {
+    inputEl.addEventListener("input", updateMatches);
+    inputEl.addEventListener("compositionstart", () => {
+        composing = true;
+        closeDropdown();
+    });
+    inputEl.addEventListener("compositionend", () => {
+        composing = false;
+        updateMatches();
+    });
+    inputEl.addEventListener("keydown", event => {
+        if (composing || event.isComposing || event.keyCode === 229) {
+            event.stopImmediatePropagation();
+            return;
+        }
         if (dropdown.style.display === "none") return;
-        if (e.key === "ArrowDown") {
-            e.preventDefault();
-            e.stopImmediatePropagation();
-            activeIndex = Math.min(activeIndex + 1, currentMatches.length - 1);
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            activeIndex = Math.max(0, Math.min(currentMatches.length - 1,
+                activeIndex + (event.key === "ArrowDown" ? 1 : -1)));
             renderDropdown();
-        } else if (e.key === "ArrowUp") {
-            e.preventDefault();
-            e.stopImmediatePropagation();
-            activeIndex = Math.max(activeIndex - 1, 0);
-            renderDropdown();
-        } else if (e.key === "Enter") {
-            if (activeIndex >= 0) {
-                e.preventDefault();
-                e.stopImmediatePropagation();
-                selectMatch(currentMatches[activeIndex]);
-            }
-        } else if (e.key === "Escape") {
-            e.stopImmediatePropagation();
+        } else if (event.key === "Enter" && activeIndex >= 0) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            selectMatch(currentMatches[activeIndex]);
+        } else if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopImmediatePropagation();
             closeDropdown();
         }
     });
-
     inputEl.addEventListener("blur", () => {
-        setTimeout(closeDropdown, 150);
+        blurTimer = setTimeout(closeDropdown, 150);
     });
-    window.addEventListener("scroll", closeDropdown, true);
-    window.addEventListener("resize", closeDropdown);
-
-    return { isOpen: () => dropdown.style.display !== "none" };
+    function onScroll(event) {
+        if (!(event.target instanceof Node) || !dropdown.contains(event.target)) positionDropdown();
+    }
+    const viewport = window.visualViewport;
+    window.addEventListener("scroll", onScroll, true);
+    window.addEventListener("resize", positionDropdown);
+    viewport?.addEventListener("resize", positionDropdown);
+    viewport?.addEventListener("scroll", positionDropdown);
+    function cleanup() {
+        disposed = true;
+        clearTimeout(blurTimer);
+        dropdown.remove();
+        window.removeEventListener("scroll", onScroll, true);
+        window.removeEventListener("resize", positionDropdown);
+        viewport?.removeEventListener("resize", positionDropdown);
+        viewport?.removeEventListener("scroll", positionDropdown);
+        suggestionCleanups.delete(cleanup);
+    }
+    suggestionCleanups.add(cleanup);
+    return { isOpen: () => dropdown.style.display !== "none", cleanup };
 }
 
 // 2. Calendar date picker
@@ -678,6 +750,7 @@ wrapper.appendChild(outputArea);
 // 3. Main function: render the meals table (and its inline "add food" row) for a given date.
 // The table is always shown, even with zero entries, so a food can always be added.
 async function renderMealsTable(dateStr) {
+    mealsState.cleanupSuggestions();
     outputArea.innerHTML = "";
 
     const filePath = `${folderPath}/${dateStr}.md`;
@@ -733,6 +806,7 @@ async function renderMealsTable(dateStr) {
     }
 
     async function rebuildTable() {
+    mealsState.cleanupSuggestions();
     // Expanding/collapsing a nutrient group rebuilds the whole table. Preserve
     // the scroll position from the container that is about to be replaced so a
     // header click does not send the user back to the left edge (or the top).
@@ -764,7 +838,7 @@ async function renderMealsTable(dateStr) {
         } else if (isLink) {
             // Resolve the link the same way Obsidian itself would (handles a bare
             // basename like "name" as well as a full path like "foods/name").
-            const targetFile = app.metadataCache.getFirstLinkpathDest(target, file.path);
+            const targetFile = resolveFoodFile(target, file.path);
             if (targetFile) {
                 const targetFm = app.metadataCache.getFileCache(targetFile)?.frontmatter;
                 if (targetFm?.nutrition) {
@@ -1162,7 +1236,6 @@ async function renderMealsTable(dateStr) {
             inp.style.width = "100%";
             inp.style.minWidth = "150px";
             styleInput(inp);
-            inp.setAttribute("list", "meals-food-datalist");
             editTd.appendChild(inp);
             td.replaceWith(editTd);
             inp.focus();
@@ -1188,7 +1261,7 @@ async function renderMealsTable(dateStr) {
             });
             inp.addEventListener("blur", () => {
                 setTimeout(() => {
-                    if (!linkSuggest.isOpen()) saveFoodEdit();
+                    if (inp.isConnected && document.activeElement !== inp && !linkSuggest.isOpen()) saveFoodEdit();
                 }, 200);
             });
         });
@@ -1399,7 +1472,6 @@ async function renderMealsTable(dateStr) {
     foodInput.type = "text";
     foodInput.placeholder = "Add a food...";
     foodInput.className = "meals-add-food-input";
-    foodInput.setAttribute("list", "meals-food-datalist");
     foodInput.style.width = "100%";
     foodInput.style.minWidth = "150px";
     styleInput(foodInput);
