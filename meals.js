@@ -47,8 +47,6 @@ const mealsConfig = {
 // Stashing state on `window` lets it survive across those re-executions.
 window.__mealsWidgetState = window.__mealsWidgetState || {
     selectedDate: moment().format("YYYY-MM-DD"),
-    foodSuggestions: null,
-    suggestionsBuiltAt: 0,
     // In-progress text in the "Add a food..." input, plus when it last lost
     // focus. A self-triggered (or vault-wide) metadata change tears down and
     // rebuilds this whole widget mid-keystroke, which blurs the input a beat
@@ -373,15 +371,13 @@ function getFoodSuggestions() {
     return suggestions;
 }
 
-// Rebuilding this means scanning every file in foods/recipes; cache it across the
-// script's re-executions (see mealsState above) and only rebuild occasionally so
-// our own frontmatter writes don't force a full vault re-scan on every add/edit.
-const SUGGESTIONS_TTL_MS = 5 * 60 * 1000;
-if (!mealsState.foodSuggestions || Date.now() - mealsState.suggestionsBuiltAt > SUGGESTIONS_TTL_MS) {
-    mealsState.foodSuggestions = getFoodSuggestions();
-    mealsState.suggestionsBuiltAt = Date.now();
+// Build the list fresh each time the popup asks for it. getFiles() and the
+// metadata cache are in-memory, so this is cheap, and it means a file added while
+// this widget is open (e.g. via an obsidian:// link on mobile) appears on the
+// next keystroke without depending on Dataview re-running this view.
+function currentFoodSuggestions() {
+    return getFoodSuggestions();
 }
-const foodSuggestions = mealsState.foodSuggestions;
 
 // Use one controlled popup for both plain names and [[links]]. Native datalist
 // popups cannot be positioned around Android's keyboard.
@@ -514,7 +510,7 @@ function attachLinkSuggest(inputEl, suggestionsList) {
             return;
         }
         linkStart = index;
-        currentMatches = suggestionsList
+        currentMatches = suggestionsList()
             .map(s => ({ s, score: fuzzyScore(query, s.alias) }))
             .filter(m => m.score !== null)
             .sort((a, b) => a.score - b.score)
@@ -1241,7 +1237,7 @@ async function renderMealsTable(dateStr) {
             inp.focus();
             inp.select();
 
-            const linkSuggest = attachLinkSuggest(inp, foodSuggestions);
+            const linkSuggest = attachLinkSuggest(inp, currentFoodSuggestions);
 
             async function saveFoodEdit() {
                 const newValue = inp.value.trim();
@@ -1477,7 +1473,7 @@ async function renderMealsTable(dateStr) {
     styleInput(foodInput);
     foodCell.appendChild(foodInput);
     addRow.appendChild(foodCell);
-    const addFoodLinkSuggest = attachLinkSuggest(foodInput, foodSuggestions);
+    const addFoodLinkSuggest = attachLinkSuggest(foodInput, currentFoodSuggestions);
 
     // Restore text left mid-typing when a rerun (see the window state comment
     // up top) tore this input down a moment ago, and pick up typing back up
@@ -1630,7 +1626,7 @@ async function renderMealsTable(dateStr) {
         if (/^\[\[.+\]\]$/.test(typedText)) {
             foodValue = typedText;
         } else {
-            const suggestionMatch = foodSuggestions.find(s => s.alias.toLowerCase() === typedText.toLowerCase());
+            const suggestionMatch = currentFoodSuggestions().find(s => s.alias.toLowerCase() === typedText.toLowerCase());
             if (suggestionMatch) {
                 foodValue = suggestionMatch.path === suggestionMatch.alias
                     ? `[[${suggestionMatch.path}]]`
