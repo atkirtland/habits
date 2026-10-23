@@ -10,6 +10,9 @@ if (!cleanFolder || !dailyTemplatePath || !Array.isArray(habitCategories)) {
 const stateKey = "habitTrackerState_" + dv.current().file.path;
 window[stateKey] ||= { selectedMonth: moment().format("YYYY-MM") };
 const state = window[stateKey];
+// Dataview may be rendered in an Obsidian popout window. Use the document that
+// owns the view instead of the main workspace's global document.
+const viewDocument = dv.container.ownerDocument;
 state.categoryVisibility ||= Object.fromEntries(habitCategories.map(c => [c.id, true]));
 habitCategories.forEach(c => state.categoryVisibility[c.id] ??= true);
 
@@ -119,7 +122,7 @@ async function updateFrontmatter(date, updates) {
 }
 
 function showNotice(message) {
-  const notice = document.createElement("div");
+  const notice = viewDocument.createElement("div");
   notice.className = "notice";
   notice.textContent = message;
   Object.assign(notice.style, {
@@ -128,7 +131,7 @@ function showNotice(message) {
     color: "var(--text-normal)", background: "var(--background-primary-alt)",
     boxShadow: "0 2px 12px rgba(0,0,0,.35)"
   });
-  document.body.appendChild(notice);
+  viewDocument.body.appendChild(notice);
   setTimeout(() => notice.remove(), 6000);
 }
 
@@ -179,7 +182,7 @@ function typedInput(parent, label, type, value) {
 class EditItemDialog {
   constructor(date, page, item, saved) { Object.assign(this, { date, page, item, saved }); }
   open() {
-    const dialog = document.createElement("dialog");
+    const dialog = viewDocument.createElement("dialog");
     this.dialog = dialog;
     dialog.className = "habit-tracker-dialog";
     Object.assign(dialog.style, {
@@ -187,7 +190,7 @@ class EditItemDialog {
       border: "1px solid var(--background-modifier-border)", borderRadius: "10px",
       color: "var(--text-normal)", background: "var(--background-primary)"
     });
-    document.body.appendChild(dialog);
+    viewDocument.body.appendChild(dialog);
     const el = dialog;
     el.createEl("h2", { text: `Edit ${this.item.label || this.item.key}` });
     el.createEl("div", { text: `Date: ${this.date}`, attr: { style: "margin:-8px 0 20px;color:var(--text-muted)" }});
@@ -197,20 +200,34 @@ class EditItemDialog {
     const error = el.createEl("div", { attr: { style: "display:none;color:var(--text-error);margin-bottom:12px" }});
     const buttons = el.createEl("div", { attr: { style: "display:flex;justify-content:flex-end;gap:10px" }});
     buttons.createEl("button", { text: "Cancel" }).onclick = () => dialog.close();
-    buttons.createEl("button", { text: "Save", cls: "mod-cta" }).onclick = async () => {
+    const save = async () => {
       const status = readStatus(), goal = readGoal ? readGoal() : {};
       if (status.error || goal.error) { error.textContent = status.error || goal.error; error.style.display = "block"; return; }
       const updates = { [this.item.key]: status.value };
       if (readGoal) updates[this.item.goalKey] = goal.value;
       await this.saved(updates); dialog.close();
     };
-    dialog.addEventListener("close", () => dialog.remove(), { once: true });
+    buttons.createEl("button", { text: "Save", cls: "mod-cta" }).onclick = save;
+    const onShortcut = event => {
+      if (dialog.open && event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        event.stopPropagation();
+        save();
+      }
+    };
+    // Capture on the popout's window so Obsidian's workspace key handling
+    // cannot consume Ctrl+Enter before it reaches an input in the dialog.
+    viewDocument.defaultView.addEventListener("keydown", onShortcut, true);
+    dialog.addEventListener("close", () => {
+      viewDocument.defaultView.removeEventListener("keydown", onShortcut, true);
+      dialog.remove();
+    }, { once: true });
     dialog.addEventListener("click", event => { if (event.target === dialog) dialog.close(); });
     dialog.showModal();
   }
 }
 
-const root = document.createElement("div"); dv.container.appendChild(root);
+const root = viewDocument.createElement("div"); dv.container.appendChild(root);
 
 function monthWeeks(pages) {
   const map = new Map(); pages.forEach(p => map.set(p.file.day.toFormat("yyyy-MM-dd"), p));
