@@ -96,19 +96,44 @@ mealsState.liveWrapper = wrapper;
 // CSS also covers replacement cells created when editing a food name.
 const tableStyle = document.createElement("style");
 tableStyle.textContent = `
-    .meals-table > tbody > tr > td:first-child {
+    /* Column 1 is the drag-handle column; column 2 (Food) stays pinned. */
+    .meals-table > tbody > tr > td:nth-child(2) {
         position: sticky;
         left: 0;
         z-index: 1;
         background: var(--background-primary);
     }
-    .meals-table > tbody > tr:hover > td:first-child {
+    .meals-table > tbody > tr:hover > td:nth-child(2) {
         background: var(--background-primary-alt);
     }
-    .meals-table > tbody > tr > td:first-child,
-    .meals-table > thead > tr:first-child > th:first-child,
-    .meals-table > thead > tr:last-child > td:first-child {
+    .meals-table > tbody > tr > td:nth-child(2),
+    .meals-table > thead > tr:first-child > th:nth-child(2),
+    .meals-table > thead > tr:last-child > td:nth-child(2) {
         box-shadow: 1px 0 0 var(--background-modifier-border);
+    }
+    .meals-table > * > tr > .meals-handle-col {
+        width: 1px;
+        min-width: 0;
+        padding-left: 2px !important;
+        padding-right: 2px !important;
+        text-align: center;
+    }
+    .meals-table > tbody > tr > td.meals-drag-handle {
+        color: var(--text-faint);
+        cursor: grab;
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+        -webkit-touch-callout: none;
+    }
+    .meals-table > tbody > tr > td.meals-drag-handle:hover {
+        color: var(--text-muted);
+    }
+    .meals-row-dragging > td.meals-drag-handle {
+        cursor: grabbing;
+    }
+    .meals-table > tbody > tr.meals-row-dragging > td {
+        background: var(--background-modifier-active-hover) !important;
     }
 `;
 wrapper.appendChild(tableStyle);
@@ -1017,6 +1042,8 @@ async function renderMealsTable(dateStr) {
         headerRow.appendChild(th);
     }
 
+    appendFlatHeader("");
+    headerRow.lastChild.className = "meals-handle-col";
     appendFlatHeader("Food");
     appendFlatHeader("Servings");
     appendFlatHeader("Serving Size");
@@ -1042,6 +1069,8 @@ async function renderMealsTable(dateStr) {
     totalsRow.style.backgroundColor = totalsBackground;
     totalsRow.style.borderTop = "0";
     totalsRow.style.borderBottom = "2px solid var(--background-modifier-border)";
+    totalsRow.appendChild(makeTd(""));
+    totalsRow.lastChild.className = "meals-handle-col";
     totalsRow.appendChild(makeTd("TOTALS"));
     totalsRow.appendChild(makeTd("-"));
     totalsRow.appendChild(makeTd("-"));
@@ -1075,7 +1104,7 @@ async function renderMealsTable(dateStr) {
         row.tabIndex = 0;
         row.setAttribute("aria-label", isDraft
             ? "Add food; right-click for comment and time"
-            : "Meal row; right-click for comment, time, and delete");
+            : "Meal row; drag the handle or press Alt+Up/Down to reorder; right-click for comment, time, and delete");
 
         function editField(key, label) {
             const modal = document.createElement("dialog");
@@ -1214,6 +1243,104 @@ async function renderMealsTable(dateStr) {
         });
     }
 
+    // Drag-to-reorder. Uses pointer events (not HTML5 drag and drop) so it also
+    // works with touch on mobile. Rows move live in the DOM while dragging; on
+    // drop the new row order is applied to `entries` and saved.
+    function entryRows() {
+        return Array.from(tbody.querySelectorAll(":scope > tr.meals-entry-row"));
+    }
+
+    function startRowDrag(event) {
+        if (event.button !== 0) return;
+        const handle = event.currentTarget;
+        const row = handle.closest("tr");
+        if (!row || entryRows().length < 2) return;
+        // An open inline edit saves (and rebuilds the table) when it loses
+        // focus, which would replace the rows mid-drag. Skip dragging then.
+        const active = document.activeElement;
+        if (active && active.tagName === "INPUT" && tbody.contains(active) && !addRow.contains(active)) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        handle.setPointerCapture(event.pointerId);
+        const originalOrder = entryRows();
+        row.classList.add("meals-row-dragging");
+
+        function onMove(e) {
+            // Scroll the table when dragging near its edges (below the sticky header).
+            const containerRect = tableContainer.getBoundingClientRect();
+            const topEdge = Math.max(containerRect.top, thead.getBoundingClientRect().bottom);
+            if (e.clientY < topEdge + 24) tableContainer.scrollTop -= 12;
+            else if (e.clientY > containerRect.bottom - 24) tableContainer.scrollTop += 12;
+
+            const others = entryRows().filter(r => r !== row);
+            const before = others.find(r => {
+                const rect = r.getBoundingClientRect();
+                return e.clientY < rect.top + rect.height / 2;
+            });
+            const reference = before || addRow;
+            if (row.nextSibling !== reference) tbody.insertBefore(row, reference);
+        }
+
+        async function onEnd(e) {
+            handle.removeEventListener("pointermove", onMove);
+            handle.removeEventListener("pointerup", onEnd);
+            handle.removeEventListener("pointercancel", onEnd);
+            row.classList.remove("meals-row-dragging");
+            if (!row.isConnected) return;
+
+            const newOrder = entryRows();
+            const changed = newOrder.some((r, i) => r !== originalOrder[i]);
+            if (!changed) return;
+            if (e.type === "pointercancel") {
+                for (const r of originalOrder) tbody.insertBefore(r, addRow);
+                return;
+            }
+            entries = newOrder.map(r => entries[Number(r.dataset.entryIndex)]);
+            await rebuildTable();
+            persistMeals();
+        }
+
+        handle.addEventListener("pointermove", onMove);
+        handle.addEventListener("pointerup", onEnd);
+        handle.addEventListener("pointercancel", onEnd);
+    }
+
+    // The whole first cell of each meal row is the handle, so it is an easy
+    // target and kept apart from the clickable food name.
+    function buildDragHandle() {
+        const handle = document.createElement("td");
+        handle.className = "meals-handle-col meals-drag-handle";
+        handle.textContent = "⋮";
+        handle.title = "Drag to reorder";
+        handle.setAttribute("aria-hidden", "true");
+        handle.addEventListener("pointerdown", startRowDrag);
+        // Keep the handle from opening the food editor or the row menu
+        // (a touch long-press fires contextmenu).
+        handle.addEventListener("click", e => e.stopPropagation());
+        handle.addEventListener("contextmenu", e => {
+            e.preventDefault();
+            e.stopPropagation();
+        });
+        return handle;
+    }
+
+    // Keyboard alternative to dragging: Alt+Up/Down on a focused row.
+    function attachKeyboardReorder(tr, entryIndex) {
+        tr.addEventListener("keydown", async e => {
+            if (e.target !== tr || !e.altKey) return;
+            if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+            e.preventDefault();
+            const to = entryIndex + (e.key === "ArrowUp" ? -1 : 1);
+            if (to < 0 || to >= entries.length) return;
+            const [moved] = entries.splice(entryIndex, 1);
+            entries.splice(to, 0, moved);
+            await rebuildTable();
+            outputArea.querySelectorAll(".meals-table > tbody > tr.meals-entry-row")[to]?.focus();
+            persistMeals();
+        });
+    }
+
     // Food-name cell, editable independently of the nutrition-edit row: click it to
     // rename/re-link the entry, with "[[" triggering foods/recipes note search.
     function buildFoodCell(food, entryIndex) {
@@ -1313,7 +1440,11 @@ async function renderMealsTable(dateStr) {
 
     function buildDisplayRow(food, entryIndex) {
         const tr = document.createElement("tr");
+        tr.className = "meals-entry-row";
+        tr.dataset.entryIndex = String(entryIndex);
         attachMealMenu(tr, entries[entryIndex]);
+        attachKeyboardReorder(tr, entryIndex);
+        tr.appendChild(buildDragHandle());
         tr.appendChild(buildFoodCell(food, entryIndex));
         tr.appendChild(buildServingsCell(food, entryIndex));
         tr.appendChild(makeTd(food.servingSize));
@@ -1365,7 +1496,10 @@ async function renderMealsTable(dateStr) {
     // inline nutrition values directly from the table.
     function buildEditRow(food, entryIndex) {
         const tr = document.createElement("tr");
+        tr.className = "meals-entry-row";
+        tr.dataset.entryIndex = String(entryIndex);
         attachMealMenu(tr, entries[entryIndex]);
+        tr.appendChild(buildDragHandle());
         tr.appendChild(buildFoodCell(food, entryIndex));
         tr.appendChild(buildServingsCell(food, entryIndex));
         tr.appendChild(makeTd(food.servingSize));
@@ -1462,6 +1596,8 @@ async function renderMealsTable(dateStr) {
     // alias it's saved as a plain (non-wikilink) custom food. Every nutrient column
     // currently displayed gets an optional input for one-off foods.
     const addRow = document.createElement("tr");
+    addRow.appendChild(makeTd(""));
+    addRow.lastChild.className = "meals-handle-col";
 
     const foodCell = document.createElement("td");
     const foodInput = document.createElement("input");
@@ -1582,10 +1718,11 @@ async function renderMealsTable(dateStr) {
         }
         // These intersections stick in both directions and cover the other
         // cells in their header tier during horizontal scrolling.
-        headerRow.cells[0].style.left = "0px";
-        headerRow.cells[0].style.zIndex = "14";
-        totalsRow.cells[0].style.left = "0px";
-        totalsRow.cells[0].style.zIndex = "12";
+        // Cell 0 is the drag-handle column; cell 1 is Food.
+        headerRow.cells[1].style.left = "0px";
+        headerRow.cells[1].style.zIndex = "14";
+        totalsRow.cells[1].style.left = "0px";
+        totalsRow.cells[1].style.zIndex = "12";
     }
     positionStickyHeaderCells();
     requestAnimationFrame(positionStickyHeaderCells);
